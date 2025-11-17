@@ -227,64 +227,54 @@ __device__ float vec_at(const float4& vec, int index) {
     return reinterpret_cast<const float*>(&vec)[index];
 }
 
-__global__ void softmax_forward_kernel5(float* out, float inv_temperature, const float* inp, int N, int T) {
+__global__ void scale_kernel(float* inp, float scale, int B, int NH, int T) {
+    // scales the pre-softmax attention scores by scale
+    // and sets the autoregressive locations to -INFINITY
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < B * NH * T * T) {
+        int rest = idx % (NH * T * T);
+        rest = rest % (T * T);
+        int t2 = rest / T;
+        int t = rest % T;
+        if (t > t2) {
+            inp[idx] = -INFINITY;
+        } else {
+            inp[idx] *= scale;
+        }
+    }
+}
+
+// Naive softmax kernel (note: input is already scaled and masked by scale_kernel)
+__global__ void softmax_forward_kernel1(float* out, const float* inp, int N, int T) {
     // inp, out shape: (N, T, T), where N = B * NH
-    // fuses the multiplication by scale inside attention
-    // directly autoregressive, so we only compute the lower triangular part
-    // uses the online softmax algorithm
-    assert(T % 4  == 0);
-    cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-    // micro-optimization: we iterate backwards so that
-    // after the softmax backward operation completes, the cache retains the
-    // part of the matrix close to the upper left corner, which benefits the
-    // matmul operation that immediately follows.
-    // int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank(); // forward order
-    int idx = (gridDim.x - blockIdx.x - 1) * warp.meta_group_size() + warp.meta_group_rank(); // backward order
-    if(idx >= N * T) {
+    // each thread handles one row
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N * T) {
         return;
     }
-    int own_pos = idx % T;
-    int pos_by_4 = own_pos / 4;
-
-    // one row of inp, i.e. inp[idx, :] of shape (T,)
-    const float* x = inp + idx * T;
-
-    // not INF, so we don't get NaNs accidentally when subtracting two values.
-    float maxval = -FLT_MAX;
-    float sumval = 0.0f;
-
-    const float4* x_vec = reinterpret_cast<const float4*>(x);
-    for (int i = warp.thread_rank(); i < pos_by_4; i += warp.size()) {
-        float4 v = x_vec[i];
-        float old_maxval = maxval;
-        for(int k = 0; k < 4; ++k) {
-            maxval = fmaxf(maxval, vec_at(v, k));
-        }
-        sumval *= expf(inv_temperature * (old_maxval - maxval));
-        for(int k = 0; k < 4; ++k) {
-            sumval += expf(inv_temperature * (vec_at(v, k) - maxval));
+    
+    const float* inp_row = inp + idx * T;
+    float* out_row = out + idx * T;
+    
+    // Find max for numerical stability
+    float maxval = -INFINITY;
+    for (int col = 0; col < T; col++) {
+        if (inp_row[col] > maxval) {
+            maxval = inp_row[col];
         }
     }
-
-    if(4*pos_by_4 + warp.thread_rank() <= own_pos) {
-        float old_maxval = maxval;
-        maxval = fmaxf(maxval, x[4*pos_by_4 + warp.thread_rank()]);
-        sumval *= expf(inv_temperature * (old_maxval - maxval));
-        sumval += expf(inv_temperature * (x[4*pos_by_4 + warp.thread_rank()] - maxval));
+    
+    // Compute exp and sum
+    double sum = 0.0;
+    for (int col = 0; col < T; col++) {
+        out_row[col] = expf(inp_row[col] - maxval);
+        sum += out_row[col];
     }
-
-    float global_maxval = cg::reduce(warp, maxval, cg::greater<float>{});
-    sumval *= expf(inv_temperature * (maxval - global_maxval));
-
-    float sum = cg::reduce(warp, sumval, cg::plus<float>{});
-    float norm = 1.f / sum;
-
-    // divide the whole row by the sum
-    for (int i = warp.thread_rank(); i <= own_pos; i += warp.size()) {
-        // recalculation is faster than doing the round-trip through memory.
-        float ev = expf(inv_temperature * (__ldcs(x + i) - global_maxval));
-        __stcs(out + idx * T + i, ev * norm);
+    
+    // Normalize
+    float norm = 1.0f / (float)sum;
+    for (int col = 0; col < T; col++) {
+        out_row[col] *= norm;
     }
 }
 
@@ -752,10 +742,15 @@ void attention_forward(float* out, float* qkvr, float* att,
     float* preatt = inp;
     cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, T, T, HS, &alpha, k, HS, T * HS, q, HS, T * HS, &beta, preatt, T, T * T, B * NH));
 
-    // multiply all elements of preatt elementwise by scale
+    // multiply all elements of preatt elementwise by scale and apply autoregressive mask
     float scale = 1.0 / sqrtf(HS);
-    int grid_size = CEIL_DIV(B * NH * T * 32, softmax_block_size);
-    softmax_forward_kernel5<<<grid_size, softmax_block_size>>>(att, scale, preatt, B * NH, T);
+    int scale_grid_size = CEIL_DIV(B * NH * T * T, block_size);
+    scale_kernel<<<scale_grid_size, block_size>>>(preatt, scale, B, NH, T);
+    cudaCheck(cudaGetLastError());
+    
+    // apply softmax
+    int grid_size = CEIL_DIV(B * NH * T, softmax_block_size);
+    softmax_forward_kernel1<<<grid_size, softmax_block_size>>>(att, preatt, B * NH, T);
     cudaCheck(cudaGetLastError());
 
     // new approach: first cuBLAS another batched matmul
