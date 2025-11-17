@@ -278,10 +278,10 @@ __global__ void softmax_forward_kernel1(float* out, const float* inp, int N, int
     }
 }
 
-__global__ void residual_forward_kernel(float* out, float* inp1, float* inp2, int N) {
+__global__ void residual_forward_kernel1(float* out, const float* inp1, const float* inp2, int N) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < N) {
-        out[idx] = __ldcs(&inp1[idx]) + __ldcs(&inp2[idx]);
+        out[idx] = inp1[idx] + inp2[idx];
     }
 }
 
@@ -768,7 +768,7 @@ void attention_forward(float* out, float* qkvr, float* att,
 void residual_forward(float* out, float* inp1, float* inp2, int N) {
     const int block_size = 256;
     const int grid_size = CEIL_DIV(N, block_size);
-    residual_forward_kernel<<<grid_size, block_size>>>(out, inp1, inp2, N);
+    residual_forward_kernel1<<<grid_size, block_size>>>(out, inp1, inp2, N);
     cudaCheck(cudaGetLastError());
 }
 
