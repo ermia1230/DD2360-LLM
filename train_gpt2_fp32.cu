@@ -67,25 +67,23 @@ namespace cg = cooperative_groups;
 // ----------------------------------------------------------------------------
 // all the kernels
 
-__device__ inline float4 add_float4(const float4& a, const float4& b) {
-    return make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
-}
-
-// use of float4 leads to using 128-bit LDG / STG instructions in SASS,
-// very helpful in memory-bound kernels like encoder_forward
-__global__ void encoder_forward_kernel3(float4* out,
-                               const int* inp, const float4* wte, const float4* wpe,
+// naive implementation into kernel, parallelize over B,T, loop over C
+__global__ void encoder_forward_kernel1(float* out,
+                               const int* inp, const float* wte, const float* wpe,
                                int B, int T, int C) {
-    int C4 = C / 4;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int N = B * T * C4;
+    int N = B * T;
+
     if (idx < N) {
-        int bt = idx / C4;
-        int b = bt / T;
-        int t = bt % T;
-        int c4 = idx % C4;
+        int b = idx / T;
+        int t = idx % T;
+        float* out_bt = out + b * T * C + t * C;
         int ix = inp[b * T + t];
-        out[b * T * C4 + t * C4 + c4] = add_float4(wte[ix * C4 + c4], wpe[t * C4 + c4]);
+        const float* wte_ix = wte + ix * C;
+        const float* wpe_t = wpe + t * C;
+        for (int i = 0; i < C; i++) {
+            out_bt[i] = wte_ix[i] + wpe_t[i];
+        }
     }
 }
 
@@ -693,11 +691,10 @@ __global__ void __launch_bounds__(16*16, 2) matmul_forward_kernel4(float* out,
 void encoder_forward(float* out,
                      const int* inp, const float* wte, const float* wpe,
                      int B, int T, int C) {
-    assert(C % 4 == 0);
     const int block_size = 512;
-    const int N = B * T * C;
-    const int grid_size = CEIL_DIV(N / 4, block_size);
-    encoder_forward_kernel3<<<grid_size, block_size>>>((float4*) out, inp, (float4*) wte, (float4*) wpe, B, T, C);
+    const int N = B * T;
+    const int grid_size = CEIL_DIV(N, block_size);
+    encoder_forward_kernel1<<<grid_size, block_size>>>(out, inp, wte, wpe, B, T, C);
     cudaCheck(cudaGetLastError());
 }
 
