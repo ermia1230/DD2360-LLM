@@ -149,7 +149,7 @@ __global__ void layernorm_forward_kernel1(float* out, float* mean, float* rstd,
     }
 }
 
-__global__ void permute_kernel(float* q, float* k, float* v,
+__global__ void permute_kernel1(float* q, float* k, float* v,
                                const float* inp,
                                int B, int N, int NH, int d) {
     // okay so now, this kernel wants Q,K,V to all be of shape (B, NH, N, d)
@@ -164,9 +164,9 @@ __global__ void permute_kernel(float* q, float* k, float* v,
         int n = rest / d;
         int d_ = rest % d;
         int inp_idx = (b * N * 3 * NH * d) + (n * 3 * NH * d) + (0 * NH * d) + (nh_ * d) + d_;
-        q[idx] = __ldcs(&inp[inp_idx]);
-        k[idx] = __ldcs(&inp[inp_idx + NH * d]);
-        v[idx] = __ldcs(&inp[inp_idx + 2 * (NH * d)]);
+        q[idx] = inp[inp_idx];
+        k[idx] = inp[inp_idx + NH * d];
+        v[idx] = inp[inp_idx + 2 * (NH * d)];
     }
 }
 
@@ -189,7 +189,7 @@ __global__ void permute_kernel_backward(float* dinp,
     }
 }
 
-__global__ void unpermute_kernel(float* inp, float *out, int B, int N, int NH, int d) {
+__global__ void unpermute_kernel1(const float* inp, float *out, int B, int N, int NH, int d) {
    // out has shape (B, nh, N, d) but we need to unpermute it to (B, N, nh, d)
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     // out[b][n][nh_][d_] <- inp[b][nh_][n][d_]
@@ -201,7 +201,7 @@ __global__ void unpermute_kernel(float* inp, float *out, int B, int N, int NH, i
         int n = rest / d;
         int d_ = rest % d;
         int other_idx = (b * NH * N * d) + (n * NH * d) + (nh_ * d) + d_;
-        out[other_idx] = __ldcs(&inp[idx]);
+        out[other_idx] = inp[idx];
     }
 }
 
@@ -743,7 +743,7 @@ void attention_forward(float* out, float* qkvr, float* att,
     v = qkvr + 2 * B * T * C;
     int total_threads = B * NH * T * HS;
     int num_blocks = CEIL_DIV(total_threads, block_size);
-    permute_kernel<<<num_blocks, block_size>>>(q, k, v, inp, B, T, NH, HS);
+    permute_kernel1<<<num_blocks, block_size>>>(q, k, v, inp, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
 
     // batched matrix multiply with cuBLAS
@@ -766,7 +766,7 @@ void attention_forward(float* out, float* qkvr, float* att,
     // now unpermute
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
     num_blocks = CEIL_DIV(B * T * C, block_size);
-    unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
+    unpermute_kernel1<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
 }
 
