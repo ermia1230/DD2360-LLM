@@ -88,7 +88,7 @@ __global__ void encoder_forward_kernel1(float* out,
 }
 
 // really bad naive kernel with atomicAdd
-__global__ void encoder_backward_kernel(float* dwte, float* dwpe,
+__global__ void encoder_backward_kernel1(float* dwte, float* dwpe,
                                         const float* dout, const int* inp,
                                         int B, int T, int C) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -695,7 +695,7 @@ void encoder_backward(float* dwte, float* dwpe,
     const int N = B * T * C;
     const int block_size = 256;
     const int grid_size = CEIL_DIV(N, block_size);
-    encoder_backward_kernel<<<grid_size, block_size>>>(dwte, dwpe, dout, inp, B, T, C);
+    encoder_backward_kernel1<<<grid_size, block_size>>>(dwte, dwpe, dout, inp, B, T, C);
     cudaCheck(cudaGetLastError());
 }
 
