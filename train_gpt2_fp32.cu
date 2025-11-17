@@ -286,7 +286,7 @@ __global__ void residual_forward_kernel1(float* out, const float* inp1, const fl
 }
 
 #define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
-__global__ void gelu_forward_kernel(float* out, const float* inp, int N) {
+__global__ void gelu_forward_kernel1(float* out, const float* inp, int N) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < N) {
         float xi = inp[i];
@@ -295,7 +295,7 @@ __global__ void gelu_forward_kernel(float* out, const float* inp, int N) {
     }
 }
 
-__global__ void gelu_backward_kernel(float* dinp, const float* inp, const float* dout, const int N) {
+__global__ void gelu_backward_kernel1(float* dinp, const float* inp, const float* dout, const int N) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < N) {
         float x = inp[i];
@@ -775,14 +775,14 @@ void residual_forward(float* out, float* inp1, float* inp2, int N) {
 void gelu_forward(float* out, const float* inp, int N) {
     const int block_size = 128;
     const int grid_size = CEIL_DIV(N, block_size);
-    gelu_forward_kernel<<<grid_size, block_size>>>(out, inp, N);
+    gelu_forward_kernel1<<<grid_size, block_size>>>(out, inp, N);
     cudaCheck(cudaGetLastError());
 }
 
 void gelu_backward(float* dinp, const float* inp, const float* dout, const int N) {
     const int block_size = 128;
     const int grid_size = CEIL_DIV(N, block_size);
-    gelu_backward_kernel<<<grid_size, block_size>>>(dinp, inp, dout, N);
+    gelu_backward_kernel1<<<grid_size, block_size>>>(dinp, inp, dout, N);
     cudaCheck(cudaGetLastError());
 }
 
