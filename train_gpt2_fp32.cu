@@ -479,10 +479,10 @@ __global__ void fused_classifier_kernel1(float* dlogits, float* losses,
     }
 
     // finally all threads calculate the gradients
+    float dloss = dlosses != NULL ? dlosses[b * T + t] : 1.0f / (B * T);
     for (int i = warp.thread_rank(); i < V; i += warp.size()) {
         float prob = expf(logits[idx * P + i] - sp.Offset) * sp.Scale;
         float* dlogits_bt = dlogits + b * T * P + t * P;
-        float dloss = dlosses[b * T + t];
         int ix = targets[b * T + t];
         float indicator = i == ix ? 1.0f : 0.0f;
         dlogits_bt[i] = (prob - indicator) * dloss;
@@ -703,7 +703,8 @@ void fused_classifier1(float* dlogits, float* losses,
                       int B, int T, int V, int P) {
     const int block_size = 128;
     const int N = B * T;
-    const int grid_size = N / (block_size / 32); // one warp per row
+    const int rows_per_block = block_size / 32; // one warp per row
+    const int grid_size = CEIL_DIV(N, rows_per_block);
     fused_classifier_kernel1<<<grid_size, block_size>>>(dlogits, losses, logits, dlosses, targets, B, T, V, P);
     cudaCheck(cudaGetLastError());
 }
