@@ -2,6 +2,30 @@
 
 LLMs in simple, pure C/CUDA with no need for 245MB of PyTorch or 107MB of cPython. Current focus is on pretraining, in particular reproducing the [GPT-2](https://github.com/openai/gpt-2) and [GPT-3](https://arxiv.org/abs/2005.14165) miniseries, along with a parallel PyTorch reference implementation in [train_gpt2.py](train_gpt2.py). You'll recognize this file as a slightly tweaked [nanoGPT](https://github.com/karpathy/nanoGPT), an earlier project of mine. Currently, llm.c is a bit faster than PyTorch Nightly (by about 7%). In addition to the bleeding edge mainline code in [train_gpt2.cu](train_gpt2.cu), we have a simple reference CPU fp32 implementation in ~1,000 lines of clean code in one file [train_gpt2.c](train_gpt2.c). I'd like this repo to only maintain C and CUDA code. Ports to other languages or repos are very welcome, but should be done in separate repos, and I am happy to link to them below in the "notable forks" section. Developer coordination happens in the [Discussions](https://github.com/karpathy/llm.c/discussions) and on Discord, either the `#llmc` channel on the [Zero to Hero](https://discord.gg/3zy8kqD9Cp) channel, or on `#llmdotc` on [GPU MODE](https://discord.gg/gpumode) Discord.
 
+## project structure
+
+Understanding the repository layout:
+
+- **Root directory**: Contains the main training and testing files, along with `requirements.txt` and `Makefile`
+  - `train_gpt2.c` - CPU-only reference implementation
+  - `train_gpt2.cu` - Main CUDA training (bleeding edge, mixed precision)
+  - `train_gpt2_fp32.cu` - Legacy fp32 CUDA training (simpler, educational)
+  - `train_gpt2.py` - PyTorch reference implementation
+  - `test_gpt2.c` / `test_gpt2.cu` / `test_gpt2_fp32.cu` - Unit tests
+  - `requirements.txt` - Python dependencies (install from root: `pip install -r requirements.txt`)
+  - `Makefile` - Build configuration for compiling C/CUDA code
+
+- **llmc/** - CUDA library headers and utilities
+  - Contains `.cuh` and `.h` files for CUDA kernels (attention, layernorm, matmul, etc.)
+  - These are implementation details used by the main training files
+  - Not a separate project - just organized library code
+
+- **dev/** - Development utilities and scripts
+  - `download_starter_pack.sh` - Downloads pretrained models and datasets
+  - `data/` - Data preparation scripts (e.g., `tinyshakespeare.py`)
+
+**Important**: Always run commands from the repository root directory, not from subdirectories like `llmc/`.
+
 ## quick start
 
 The best introduction to the llm.c repo today is reproducing the GPT-2 (124M) model. [Discussion #481](https://github.com/karpathy/llm.c/discussions/481) steps through this in detail. We can reproduce other models from the GPT-2 and GPT-3 series in both llm.c and in the parallel implementation of PyTorch. Have a look at the [scripts README](scripts/README.md).
