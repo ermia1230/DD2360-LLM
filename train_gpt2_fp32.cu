@@ -382,44 +382,73 @@ __global__ void layernorm_backward_kernel1(float* dinp, float* dweight, float* d
     }
 }
 
-__global__ void softmax_autoregressive_backward_kernel1(float* dpreatt, const float* datt, const float* att,
-                                                     int B, int T, int C, int NH) {
-    // dpreatt, datt, att are all (B, NH, T, T)
-    int t3 = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t3 < T) {
-        int hs = C / NH; // head size
-        float scale = 1.0f / sqrtf(hs);
-        for (int b = 0; b < B; b++) {
-            for (int h = 0; h < NH; h++) {
-                for (int t = t3; t < T; t++) {
-                    const float* att_bth = att + b*NH*T*T + h*T*T + t*T;
-                    const float* datt_bth = datt + b*NH*T*T + h*T*T + t*T;
-                    float* dpreatt_bth = dpreatt + b*NH*T*T + h*T*T + t*T;
-                    float accum = 0.0f;
-                    for (int t2 = 0; t2 <= t; t2++) {
-                        float indicator = t2 == t3 ? 1.0f : 0.0f;
-                        float local_derivative = att_bth[t2] * (indicator - att_bth[t3]);
-                        accum +=  scale * local_derivative * datt_bth[t2];
-                    }
-                    dpreatt_bth[t3] = accum;
-                }
-            }
+__global__ void softmax_autoregressive_backward_kernel(float* dpreatt, const float* datt, const float* att,
+                                                       int B, int T, int C, float scale) {
+    constexpr const int BlockSize = 256;
+    constexpr int T_per_block = 4;
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    __shared__ float block_acc[32];
+
+    int idx = blockIdx.y;
+    // go through blocks in reverse order, so the slowest block starts first
+    int t0 = T - 1 - T_per_block*blockIdx.x;
+
+    att += idx * T * T;
+    datt += idx * T * T;
+    dpreatt += idx * T * T;
+
+    if (warp.meta_group_rank() == 0) {
+        block_acc[warp.thread_rank()] = 0;
+    }
+
+    for(int to = 0; to < T_per_block; ++to) {
+        int t = t0 - to;
+        if(t < 0) return;
+        const float* att_bth = att + t * T;
+        const float* datt_bth = datt + t * T;
+        float* dpreatt_bth = dpreatt + t * T;
+
+        float local_sum = 0;
+        for (int t2 = block.thread_rank(); t2 <= t; t2 += BlockSize) {
+            local_sum += att_bth[t2] * datt_bth[t2];
+        }
+
+        block_acc[warp.meta_group_rank()] = cg::reduce(warp, local_sum, cg::plus<float>{});
+        block.sync();
+        local_sum = cg::reduce(warp, block_acc[warp.thread_rank()], cg::plus<float>{});
+
+        for (int t3 = block.thread_rank(); t3 <= t; t3 += BlockSize) {
+            // don't touch the cache. Some parts will still be here from the previous loop, and
+            // we want to exploit those.
+            float acc = __ldcs(att_bth + t3) * (__ldcs(datt_bth + t3) - local_sum);
+            __stcs(dpreatt_bth + t3, scale * acc);
         }
     }
 }
 
-// naive fused kernel
-__global__ void adamw_kernel1(float* params_memory, const float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
+// Implements linear interpolation using only two floating-point operations (as opposed to three in a naive implementation).
+// Reference: https://developer.nvidia.com/blog/lerp-faster-cuda
+__device__ inline float lerp(float start, float end, float weight) {
+    return fma(weight, end, fma(-weight, start, start));
+}
+
+__global__ void adamw_kernel2(float* params_memory, float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
                               float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
    int i = blockIdx.x * blockDim.x + threadIdx.x;
    if (i >= num_parameters) return;  // guard
+   float grad = grads_memory[i];
+   float m = m_memory[i];
+   float v = v_memory[i];
    // update the first moment (momentum)
-   m_memory[i] = beta1 * m_memory[i] + (1.0f - beta1) * grads_memory[i];
+   m = lerp(grad, m, beta1);
+   m_memory[i] = m;
    // update the second moment (RMSprop)
-   v_memory[i] = beta2 * v_memory[i] + (1.0f - beta2) * grads_memory[i] * grads_memory[i];
-   float m_hat = m_memory[i] / beta1_correction;
-   float v_hat = v_memory[i] / beta2_correction;
-   params_memory[i] -= learning_rate * (m_hat / (sqrtf(v_hat) + eps) + weight_decay * params_memory[i]);
+   v = lerp(grad * grad, v, beta2);
+   v_memory[i] = v;
+   m /= beta1_correction;  // m_hat
+   v /= beta2_correction;  // v_hat
+   params_memory[i] -= learning_rate * (m / (sqrtf(v) + eps) + weight_decay * params_memory[i]);
 }
 
 struct SoftmaxParams {
@@ -427,85 +456,172 @@ struct SoftmaxParams {
     float Offset;
 };
 
-__device__ SoftmaxParams prepare_softmax(cg::thread_block_tile<32>& warp,
-                                         int idx, const float* inp, int V, int P) {
-    // this warp (of 32) threads processes one row of inp, i.e. inp[idx, :] of shape (V,)
-    // note that inp is actually (B * T, P) but we only use the first V elements
+
+__device__ SoftmaxParams prepare_softmax_blockwide_nofloat4(cg::thread_block_tile<32>& warp,
+                                                   int idx, const float* inp, int V, int P) {
+    // same but not float4
+    // one row of inp, i.e. inp[idx, :] of shape (V,)
+
     const float* x = inp + idx * P;
-    // thread coarsening loop, where the 32 threads serially process all V elements
-    float maxval = -INFINITY;
-    float sumval = 0.0f;
-    for (int i = warp.thread_rank(); i < V; i += warp.size()) {
+    float thread_maxval = -INFINITY;
+    float thread_sumval = 0.0f;
+    // do the loop in reverse to maximise probability of L2 cache hits
+    // so even small L2s get some hits on the 2nd read of the same thread
+    for (int i = V + threadIdx.x - blockDim.x; i >= 0; i -= blockDim.x) {
         float v = x[i];
-        float old_maxval = maxval;
-        // online softmax recurrence from "Online normalizer calculation for softmax" paper
-        maxval = fmaxf(maxval, v);
-        sumval *= expf((old_maxval - maxval));
-        sumval += expf(v - maxval);
+        float old_maxval = thread_maxval;
+        thread_maxval = fmaxf(thread_maxval, v);
+        thread_sumval *= expf((old_maxval - thread_maxval));
+        thread_sumval += expf(v - thread_maxval);
     }
-    // warp-level reduction to get the maxval across the 32 threads
-    float global_maxval = cg::reduce(warp, maxval, cg::greater<float>{});
-    // all 32 threads do a final shift of the sum considering the global max in this row
-    sumval *= expf((maxval - global_maxval));
-    // warp-level reduction to get the sumval across the 32 threads
-    float global_sumval = cg::reduce(warp, sumval, cg::plus<float>{});
-    // the final normalization factor
-    float norm = 1.0f / global_sumval;
-    return SoftmaxParams{norm, global_maxval};
+
+    // two reductions of up to 1024 threads:
+    // 1) inside warp (shuffle), 2) cross-warp (shared memory), 3) inside warp (shuffle)
+    // this results in much cleaner assembly than a multi-warp cg::reduce
+    __shared__ float shared_maxval[32];
+    __shared__ float shared_sumval[32];
+    int num_warps = blockDim.x / 32;
+    int warp_id = threadIdx.x / 32;
+    int lane_id = threadIdx.x % 32;
+
+    // reduce maxval within each warp
+    float warp_maxval = cg::reduce(warp, thread_maxval, cg::greater<float>{});
+    // thread 0 in each warp writes to shared memory
+    if (lane_id == 0) { shared_maxval[warp_id] = warp_maxval; }
+    __syncthreads();
+    // each thread now loads the maxval across previous warps
+    // if the thread is "out of range" of data, use -FLT_MAX as the maxval
+    warp_maxval = (lane_id < num_warps) ? shared_maxval[lane_id] : -FLT_MAX;
+    // now reduce the maxval among the warp threads
+    float block_maxval = cg::reduce(warp, warp_maxval, cg::greater<float>{});
+    // each thread uses maxval to scale sumval to avoid numerical instability / overflow
+    thread_sumval *= expf(thread_maxval - block_maxval);
+    // (warp-level) reduce sumval, thread 0 in each warp saves result in shared memory
+    float warp_sumval = cg::reduce(warp, thread_sumval, cg::plus<float>{});
+    if (lane_id == 0) { shared_sumval[warp_id] = warp_sumval; }
+    __syncthreads();
+    // same strategy, now reduce sumval across warps
+    warp_sumval = (lane_id < num_warps) ? shared_sumval[lane_id] : 0.0f;
+    float block_sumval = cg::reduce(warp, warp_sumval, cg::plus<float>{});
+    // return the softmax parameters
+    return SoftmaxParams{1.f / block_sumval, block_maxval};
 }
 
-__global__ void fused_classifier_kernel1(float* dlogits, float* losses,
-                             const float* logits, const float* dlosses, const int* targets,
-                             int B, int T, int V, int P) {
+// same as 2 but not using float4 (see dev/cuda/classifier_fused.cu)
+// will _update_ logits to logit gradients
+__global__ void fused_classifier_kernel3(float* logits, float* losses, float* probs,
+                                         const float* dlosses, const int* targets,
+                                         int B, int T, int V, int P) {
     namespace cg = cooperative_groups;
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-    // each block of warps is in charge of several rows of the input, one warp per row
-    int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
-    if (idx >= B * T) {
-        return;
-    }
-    int b = idx / T;
-    int t = idx % T;
+    int idx = blockIdx.x;
+    int ix = targets[idx];
 
-    // calculate the offset (maxval) and scale (sumval) for the softmax
-    SoftmaxParams sp = prepare_softmax(warp, idx, logits, V, P);
+    // softmax (reading B * T * V, same logits read again below, hopefully still in cache)
+    SoftmaxParams sp = prepare_softmax_blockwide_nofloat4(warp, idx, logits, V, P);
 
-    // in each row (handled by one warp), thread 0 calculates the loss
-    if(warp.thread_rank() == 0) {
-        int ix = targets[b * T + t];
+    // calculate the probability needed for the loss and update (single-threaded)
+    if(threadIdx.x == 0) {
         float prob = expf(logits[idx * P + ix] - sp.Offset) * sp.Scale;
-        losses[b * T + t] = -logf(prob);
+        losses[idx] = -logf(prob);
     }
 
-    // finally all threads calculate the gradients
-    float dloss = dlosses != NULL ? dlosses[b * T + t] : 1.0f / (B * T);
-    for (int i = warp.thread_rank(); i < V; i += warp.size()) {
-        float prob = expf(logits[idx * P + i] - sp.Offset) * sp.Scale;
-        float* dlogits_bt = dlogits + b * T * P + t * P;
-        int ix = targets[b * T + t];
-        float indicator = i == ix ? 1.0f : 0.0f;
-        dlogits_bt[i] = (prob - indicator) * dloss;
+    // very sensible default for dlosses is 1/(B*T), which is the uniform loss
+    float dloss = dlosses != NULL ? dlosses[idx] : 1.0f / (B*T);
+    // calculate the gradients directly, saves bandwidth from probs during training
+    // but also supports writing probs for inference-only and debugging
+    const float* logits_vec = logits + idx * P;
+    for (int i = threadIdx.x; i < V; i += blockDim.x) {
+        // this is the 2nd read of logits after the one in prepare_softmax2
+        // this data will never be needed again, so we reduce cache persistence
+        float v = __ldcs(&logits_vec[i]);
+        float prob = expf(v - sp.Offset) * sp.Scale;
+        if (probs != NULL) {
+            probs[idx * P + i] = prob;
+        }
+        float indicator = (i == ix) ? 1.0f : 0.0f;
+        logits[idx * P + i] = (prob - indicator) * dloss;
     }
 }
 
-// kernel 1: naive kernel, every thread handles one output element, direct global memory access
-__global__ void matmul_forward_kernel1(float* out,
-                                       const float* inp, const float* weight, const float* bias,
-                                       int BT, int C, int OC) {
+__device__ float4 ld_vec(const float* address) {
+    return *reinterpret_cast<const float4*>(address);
+}
+
+__device__ void st_vec(float* address, float4 val) {
+    *reinterpret_cast<float4*>(address) = val;
+}
+
+__global__ void __launch_bounds__(16*16, 2) matmul_forward_kernel4(float* out,
+                                                                   const float* inp, const float* weight, const float* bias,
+                                                                   int C, int OC) {
     // out is (B,T,OC). OC is short for "output channels", e.g. OC = 4 * C
     // inp is (B,T,C), weight is (OC, C), bias is (OC)
-    // in the naive kernel, every thread handles one element of out
-    int bt = blockIdx.x * blockDim.x + threadIdx.x;
-    int oc = blockIdx.y * blockDim.y + threadIdx.y;
-    if (bt < BT && oc < OC) {
-        float val = (bias != NULL) ? bias[oc] : 0.0f;
-        const float* wrow = weight + oc * C;
-        const float* inp_bt = inp + bt * C;
-        for (int i = 0; i < C; i++) {
-            val += inp_bt[i] * wrow[i];
+    // each thread handles 8x8 elements; each block 128 by 128 elements.
+    int oc = 8*(blockIdx.y * blockDim.y + threadIdx.y);
+
+    // buffers to cache chunks of the input matrices
+    __shared__ float lhs_s[128][32];
+    __shared__ float rhs_s[128][32];
+
+    // adjust our pointers for the current block
+    inp += 128 * blockIdx.x * C;
+    weight += 128 * blockIdx.y * C;
+    out += 128 * blockIdx.x * OC + 128 * blockIdx.y;
+
+    float vals[8][8] = {};
+    if(bias != NULL) {
+        for (int i = 0; i < 8; i++) {
+            for (int j = 0; j < 8; j += 4) {
+                float4 b = ld_vec(bias + oc + j);
+                vals[i][j+0] = b.x;
+                vals[i][j+1] = b.y;
+                vals[i][j+2] = b.z;
+                vals[i][j+3] = b.w;
+            }
         }
-        out[bt * OC + oc] = val;
+    }
+
+    int si_start = 4*(16 * threadIdx.y + threadIdx.x);
+    for (int so = 0; so < C; so += 32) {
+        __syncthreads();
+        int xmod8 = threadIdx.x % 8;
+        int xby8 = threadIdx.x / 8;
+        int xo = 4 * xmod8;
+        for(int y = 2 * threadIdx.y + xby8; y < 128; y += 32) {
+            st_vec(&lhs_s[y][xo], ld_vec(inp + y * C + so + xo));
+            st_vec(&rhs_s[y][xo], ld_vec(weight + y * C + so + xo));
+        }
+        __syncthreads();
+
+        for (int si = si_start; si < si_start + 32; si += 4) {
+            float4 rhs[8];
+            for (int u = 0; u < 8; ++u) {
+                rhs[u] = ld_vec(&rhs_s[u + 8 * threadIdx.y][si % 32]);
+            }
+
+            for (int ii = 0; ii < 8; ++ii) {
+                float4 lhs = ld_vec(&lhs_s[ii + 8 * threadIdx.x][si % 32]);
+                for (int ji = 0; ji < 8; ++ji) {
+                    vals[ii][ji] += lhs.x * rhs[ji].x;
+                    vals[ii][ji] += lhs.y * rhs[ji].y;
+                    vals[ii][ji] += lhs.z * rhs[ji].z;
+                    vals[ii][ji] += lhs.w * rhs[ji].w;
+                }
+            }
+        }
+    }
+
+    for (int i = 0; i < 8; ++i) {
+        for (int j = 0; j < 8; j += 4) {
+            float4 result;
+            result.x = vals[i][j + 0];
+            result.y = vals[i][j + 1];
+            result.z = vals[i][j + 2];
+            result.w = vals[i][j + 3];
+            st_vec(out + (8*threadIdx.x+i) * OC + 8*threadIdx.y + j, result);
+        }
     }
 }
 
@@ -543,16 +659,17 @@ void layernorm_forward(float* out, float* mean, float* rstd,
     cudaCheck(cudaGetLastError());
 }
 
+// kernel 1 is the most naive matmul kernel
 void matmul_forward(float* out,
                     const float* inp, const float* weight, const float* bias,
                     int B, int T, int C, int OC) {
     // out is (B,T,OC). OC is short for "output channels", e.g. OC = 4 * C
     // inp is (B,T,C), weight is (OC, C), bias is (OC)
-    const int BT = B * T;
-    const int block_size = 32;
-    dim3 gridDim(CEIL_DIV(BT, block_size), CEIL_DIV(OC, block_size));
-    dim3 blockDim(block_size, block_size);
-    matmul_forward_kernel1<<<gridDim, blockDim>>>(out, inp, weight, bias, BT, C, OC);
+    int sqrt_block_size = 16;
+
+    dim3 gridDim(CEIL_DIV(B * T, 8*sqrt_block_size), CEIL_DIV(OC, 8*sqrt_block_size));
+    dim3 blockDim(sqrt_block_size, sqrt_block_size);
+    matmul_forward_kernel4<<<gridDim, blockDim>>>(out, inp, weight, bias, C, OC);
     cudaCheck(cudaGetLastError());
 }
 
@@ -685,8 +802,9 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
     // backward into dv
     cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, HS, T, T, &one, scratch, HS, T * HS, att, T, T * T, &zero, dv, HS, T * HS, B * NH));
     // backward into preatt
-    num_blocks = CEIL_DIV(T, block_size);
-    softmax_autoregressive_backward_kernel1<<<dim3(num_blocks, B*NH), block_size>>>(dpreatt, datt, att, B, T, C, NH);
+    int hs = C / NH; // head size
+    float scale = 1.0f / sqrtf(hs);
+    softmax_autoregressive_backward_kernel<<<dim3(T / 4, B * NH), 256>>>(dpreatt, datt, att, B, T, C, scale);
     cudaCheck(cudaGetLastError());
     // backward into q
     cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, HS, T, T, &one, k, HS, T * HS, dpreatt, T, T * T, &zero, dq, HS, T * HS, B * NH));
@@ -698,14 +816,14 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
     cudaCheck(cudaGetLastError());
 }
 
-void fused_classifier1(float* dlogits, float* losses,
-                      const float* logits, const float* dlosses, const int* targets,
+// replaces logits with logit gradients
+void fused_classifier3(float* logits, float* losses,
+                      const float* dlosses, const int* targets,
                       int B, int T, int V, int P) {
-    const int block_size = 128;
+    const int block_size = 1024;
     const int N = B * T;
-    const int rows_per_block = block_size / 32; // one warp per row
-    const int grid_size = CEIL_DIV(N, rows_per_block);
-    fused_classifier_kernel1<<<grid_size, block_size>>>(dlogits, losses, logits, dlosses, targets, B, T, V, P);
+    const int grid_size = N;
+    fused_classifier_kernel3<<<grid_size, block_size>>>(logits, losses, NULL, dlosses, targets, B, T, V, P);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1115,8 +1233,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
     if (targets != NULL) {
         // fused classifier: does the forward pass and first part of the backward pass
         // we're passing dlosses = NULL, which will default them to 1.0f/(B*T), i.e. uniform loss
-        // note: dlogits and logits can be the same buffer (in-place overwrite)
-        fused_classifier1(acts.output, acts.losses, acts.output, NULL, model->targets, B, T, V, Vp);
+        fused_classifier3(acts.output, acts.losses, NULL, model->targets, B, T, V, Vp);
         // for convenience also evaluate the mean loss (TODO re-think this compute+sync point)
         // move the (B,T) losses to CPU
         cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(float), cudaMemcpyDeviceToHost));
@@ -1277,7 +1394,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     int num_blocks = CEIL_DIV(model->num_parameters, block_size);
     float beta1_correction = 1.0f - powf(beta1, t);
     float beta2_correction = 1.0f - powf(beta2, t);
-    adamw_kernel1<<<num_blocks, block_size>>>(model->params_memory, model->grads_memory, model->m_memory, model->v_memory,
+    adamw_kernel2<<<num_blocks, block_size>>>(model->params_memory, model->grads_memory, model->m_memory, model->v_memory,
                                               model->num_parameters,
                                               learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
     cudaCheck(cudaGetLastError());
