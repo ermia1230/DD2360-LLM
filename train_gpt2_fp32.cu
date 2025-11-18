@@ -480,39 +480,43 @@ __device__ SoftmaxParams prepare_softmax_blockwide_nofloat4(cg::thread_block_til
 
 // same as 2 but not using float4 (see dev/cuda/classifier_fused.cu)
 // will _update_ logits to logit gradients
-__global__ void fused_classifier_kernel3(float* logits, float* losses, float* probs,
-                                         const float* dlosses, const int* targets,
-                                         int B, int T, int V, int P) {
+__global__ void fused_classifier_kernel1(float* logits, float* losses,
+                             const float* dlosses, const int* targets,
+                             int B, int T, int V, int P) {
     namespace cg = cooperative_groups;
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-    int idx = blockIdx.x;
-    int ix = targets[idx];
+    // example: B = 4, T = 1024, block_size = 128 => we'd have grid_size = 1024
+    // each block of 4 warps is in charge of 4 rows of the input, one warp per row
+    // meta_group_size is the number of warps per block (e.g. 4)
+    // meta_group_rank is the index of the warp in the block (e.g. 0, 1, 2, 3)
+    int64_t idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
+    if (idx >= B * T) { // there are B * T rows in the input
+        return;
+    }
+    int b = idx / T;
+    int t = idx % T;
 
-    // softmax (reading B * T * V, same logits read again below, hopefully still in cache)
-    SoftmaxParams sp = prepare_softmax_blockwide_nofloat4(warp, idx, logits, V, P);
+    // calculate the offset (maxval) and scale (sumval) for the softmax
+    SoftmaxParams sp = prepare_softmax(warp, idx, logits, V, P);
 
-    // calculate the probability needed for the loss and update (single-threaded)
-    if(threadIdx.x == 0) {
+    // in each row (handled by one warp), thread 0 calculates the loss
+    // calculate the probability needed for the loss and update losses
+    if(warp.thread_rank() == 0) {
+        int ix = targets[b * T + t];
         float prob = expf(logits[idx * P + ix] - sp.Offset) * sp.Scale;
-        losses[idx] = -logf(prob);
+        losses[b * T + t] = -logf(prob);
     }
 
-    // very sensible default for dlosses is 1/(B*T), which is the uniform loss
-    float dloss = dlosses != NULL ? dlosses[idx] : 1.0f / (B*T);
-    // calculate the gradients directly, saves bandwidth from probs during training
-    // but also supports writing probs for inference-only and debugging
-    const float* logits_vec = logits + idx * P;
-    for (int i = threadIdx.x; i < V; i += blockDim.x) {
-        // this is the 2nd read of logits after the one in prepare_softmax2
-        // this data will never be needed again, so we reduce cache persistence
-        float v = __ldcs(&logits_vec[i]);
-        float prob = expf(v - sp.Offset) * sp.Scale;
-        if (probs != NULL) {
-            probs[idx * P + i] = prob;
-        }
-        float indicator = (i == ix) ? 1.0f : 0.0f;
-        logits[idx * P + i] = (prob - indicator) * dloss;
+    // finally all threads calculate the gradients
+    // prob is only materialized here temporarily and in registers, never
+    // as a full tensor that gets written to global memory
+    for (int i = warp.thread_rank(); i < V; i += warp.size()) {
+        float prob = expf(logits[idx * P + i] - sp.Offset) * sp.Scale;
+        float dloss = dlosses[b * T + t];
+        int ix = targets[b * T + t];
+        float indicator = i == ix ? 1.0f : 0.0f;
+        logits[b * T * P + t * P + i] = (prob - indicator) * dloss;
     }
 }
 
@@ -737,10 +741,10 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
 void fused_classifier3(float* logits, float* losses,
                       const float* dlosses, const int* targets,
                       int B, int T, int V, int P) {
-    const int block_size = 1024;
+    const int block_size = 128;
     const int N = B * T;
-    const int grid_size = N;
-    fused_classifier_kernel3<<<grid_size, block_size>>>(logits, losses, NULL, dlosses, targets, B, T, V, P);
+    const int grid_size = CEIL_DIV(N, block_size / 32);
+    fused_classifier_kernel1<<<grid_size, block_size>>>(logits, losses, dlosses, targets, B, T, V, P);
     cudaCheck(cudaGetLastError());
 }
 
