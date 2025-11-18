@@ -483,20 +483,20 @@ __global__ void fused_classifier_kernel1(float* logits, float* losses,
     // in each row (handled by one warp), thread 0 calculates the loss
     // calculate the probability needed for the loss and update losses
     if(warp.thread_rank() == 0) {
-        int ix = targets[b * T + t];
+        int ix = targets[idx];
         float prob = expf(logits[idx * P + ix] - sp.Offset) * sp.Scale;
-        losses[b * T + t] = -logf(prob);
+        losses[idx] = -logf(prob);
     }
 
     // finally all threads calculate the gradients
     // prob is only materialized here temporarily and in registers, never
     // as a full tensor that gets written to global memory
+    float dloss = dlosses != NULL ? dlosses[idx] : 1.0f / (B*T);
+    int ix = targets[idx];
     for (int i = warp.thread_rank(); i < V; i += warp.size()) {
         float prob = expf(logits[idx * P + i] - sp.Offset) * sp.Scale;
-        float dloss = dlosses[b * T + t];
-        int ix = targets[b * T + t];
         float indicator = i == ix ? 1.0f : 0.0f;
-        logits[b * T * P + t * P + i] = (prob - indicator) * dloss;
+        logits[idx * P + i] = (prob - indicator) * dloss;
     }
 }
 
