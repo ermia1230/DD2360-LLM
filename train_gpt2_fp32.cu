@@ -427,55 +427,35 @@ struct SoftmaxParams {
     float Offset;
 };
 
-
-__device__ SoftmaxParams prepare_softmax_blockwide_nofloat4(cg::thread_block_tile<32>& warp,
-                                                   int idx, const float* inp, int V, int P) {
-    // same but not float4
-    // one row of inp, i.e. inp[idx, :] of shape (V,)
-
+__device__ SoftmaxParams prepare_softmax(cg::thread_block_tile<32>& warp,
+                                         int64_t idx, const float* inp, int V, int P) {
+    // this warp (of 32) threads processes one row of inp, i.e. inp[idx, :] of shape (V,)
+    // note that inp is actually (B * T, P) but we only use the first V elements
+    // this function then calculates:
+    // 1) the max value to subtract for numerical stability and
+    // 2) the sum normalization factor
     const float* x = inp + idx * P;
-    float thread_maxval = -INFINITY;
-    float thread_sumval = 0.0f;
-    // do the loop in reverse to maximise probability of L2 cache hits
-    // so even small L2s get some hits on the 2nd read of the same thread
-    for (int i = V + threadIdx.x - blockDim.x; i >= 0; i -= blockDim.x) {
+    // thread coarsening loop, where the 32 threads serially process all V elements
+    // thread_rank() is in [0, 31], warp.size() is 32
+    float maxval = -INFINITY;
+    float sumval = 0.0f;
+    for (int i = warp.thread_rank(); i < V; i += warp.size()) {
         float v = x[i];
-        float old_maxval = thread_maxval;
-        thread_maxval = fmaxf(thread_maxval, v);
-        thread_sumval *= expf((old_maxval - thread_maxval));
-        thread_sumval += expf(v - thread_maxval);
+        float old_maxval = maxval;
+        // online softmax recurrence from "Online normalizer calculation for softmax" paper
+        maxval = fmaxf(maxval, v);
+        sumval *= expf((old_maxval - maxval));
+        sumval += expf(v - maxval);
     }
-
-    // two reductions of up to 1024 threads:
-    // 1) inside warp (shuffle), 2) cross-warp (shared memory), 3) inside warp (shuffle)
-    // this results in much cleaner assembly than a multi-warp cg::reduce
-    __shared__ float shared_maxval[32];
-    __shared__ float shared_sumval[32];
-    int num_warps = blockDim.x / 32;
-    int warp_id = threadIdx.x / 32;
-    int lane_id = threadIdx.x % 32;
-
-    // reduce maxval within each warp
-    float warp_maxval = cg::reduce(warp, thread_maxval, cg::greater<float>{});
-    // thread 0 in each warp writes to shared memory
-    if (lane_id == 0) { shared_maxval[warp_id] = warp_maxval; }
-    __syncthreads();
-    // each thread now loads the maxval across previous warps
-    // if the thread is "out of range" of data, use -FLT_MAX as the maxval
-    warp_maxval = (lane_id < num_warps) ? shared_maxval[lane_id] : -FLT_MAX;
-    // now reduce the maxval among the warp threads
-    float block_maxval = cg::reduce(warp, warp_maxval, cg::greater<float>{});
-    // each thread uses maxval to scale sumval to avoid numerical instability / overflow
-    thread_sumval *= expf(thread_maxval - block_maxval);
-    // (warp-level) reduce sumval, thread 0 in each warp saves result in shared memory
-    float warp_sumval = cg::reduce(warp, thread_sumval, cg::plus<float>{});
-    if (lane_id == 0) { shared_sumval[warp_id] = warp_sumval; }
-    __syncthreads();
-    // same strategy, now reduce sumval across warps
-    warp_sumval = (lane_id < num_warps) ? shared_sumval[lane_id] : 0.0f;
-    float block_sumval = cg::reduce(warp, warp_sumval, cg::plus<float>{});
-    // return the softmax parameters
-    return SoftmaxParams{1.f / block_sumval, block_maxval};
+    // warp-level reduction to get the maxval across the 32 threads
+    float global_maxval = cg::reduce(warp, maxval, cg::greater<float>{});
+    // all 32 threads do a final shift of the sum considering the global max in this row
+    sumval *= expf((maxval - global_maxval));
+    // warp-level reduction to get the sumval across the 32 threads
+    float global_sumval = cg::reduce(warp, sumval, cg::plus<float>{});
+    // the final normalization factor
+    float norm = 1.0f / global_sumval;
+    return SoftmaxParams{norm, global_maxval};
 }
 
 // same as 2 but not using float4 (see dev/cuda/classifier_fused.cu)
