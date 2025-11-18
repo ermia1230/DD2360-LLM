@@ -474,8 +474,6 @@ __global__ void fused_classifier_kernel1(float* logits, float* losses,
     if (idx >= B * T) { // there are B * T rows in the input
         return;
     }
-    int b = idx / T;
-    int t = idx % T;
 
     // calculate the offset (maxval) and scale (sumval) for the softmax
     SoftmaxParams sp = prepare_softmax(warp, idx, logits, V, P);
