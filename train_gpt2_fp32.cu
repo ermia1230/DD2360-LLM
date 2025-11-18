@@ -783,9 +783,9 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
     // backward into dv
     cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, HS, T, T, &one, scratch, HS, T * HS, att, T, T * T, &zero, dv, HS, T * HS, B * NH));
     // backward into preatt
-    const int block_size = 256;
-    const int num_blocks = CEIL_DIV(T, block_size);
-    softmax_autoregressive_backward_kernel1<<<dim3(num_blocks, 1), block_size>>>(dpreatt, datt, att, B, T, C, NH);
+    const int softmax_block_size = 256;
+    const int softmax_grid_size = CEIL_DIV(T, softmax_block_size);
+    softmax_autoregressive_backward_kernel1<<<dim3(softmax_grid_size, 1), softmax_block_size>>>(dpreatt, datt, att, B, T, C, NH);
     cudaCheck(cudaGetLastError());
     // backward into q
     cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, HS, T, T, &one, k, HS, T * HS, dpreatt, T, T * T, &zero, dq, HS, T * HS, B * NH));
