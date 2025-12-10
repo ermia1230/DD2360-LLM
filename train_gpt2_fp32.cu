@@ -1477,8 +1477,8 @@ int main(int argc, char *argv[]) {
     DataLoader train_loader, val_loader;
     dataloader_init(&train_loader, train_data_pattern, B, T, 0, 1, 1);
     dataloader_init(&val_loader, val_data_pattern, B, T, 0, 1, 0);
-    int train_num_batches = train_loader.num_tokens / (B*T); // let's do 1 epoch by default for now
-    int val_num_batches = val_loader.num_tokens / (B*T);
+    int train_num_batches = 1;// train_loader.num_tokens / (B*T); // let's do 1 epoch by default for now
+    int val_num_batches = 1; // val_loader.num_tokens / (B*T);
     if (val_num_batches > val_max_steps) { val_num_batches = val_max_steps; }
     printf("| train_num_batches     | %-50d |\n", train_num_batches);
     printf("| val_num_batches       | %-50d |\n", val_num_batches);
@@ -1521,41 +1521,42 @@ int main(int argc, char *argv[]) {
         }
 
         // once in a while do model inference to print generated text
-        if (step > 0 && step % sample_every == 0 || last_step) {
-            // fill up gen_tokens with the GPT2_EOT, which kicks off the generation
-            for(int i = 0; i < B * T; ++i) {
-                gen_tokens[i] = GPT2_EOT;
-            }
-            // now sample from the model autoregressively
-            printf("generating:\n---\n");
-            for (int t = 1; t < genT; t++) {
-                // note that inference is very wasteful here because for each token
-                // we re-calculate the forward pass for all of (B,T) positions from scratch
-                // but the inference here is just for sanity checking anyway
-                // and we can maybe optimize a bit more later, with careful tests
-                gpt2_forward(&model, gen_tokens, NULL, B, T);
-                // furthermore, below we're only using b=0 (i.e. the first row) of all B rows
-                // we're in principle running B "inference streams" in parallel here
-                // only using position 0 because it's a bit faster (copy less probs from GPU -> CPU)
-                // get the V-dimensional vector probs[0, t-1, :]
-                float* logits = model.acts.output + (t - 1) * model.config.padded_vocab_size;
-                // move probs back to CPU and sample (note we only move the first vocab_size logits, ignoring the padding)
-                cudaCheck(cudaMemcpy(cpu_logits, logits, model.config.vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
-                float coin = random_f32(&rng_state);
-                int next_token = sample_softmax(cpu_logits, model.config.vocab_size, coin);
-                gen_tokens[t] = next_token;
-                // print the generated token, either using the Tokenizer or a fallback
-                if (tokenizer.init_ok) {
-                    const char* token_str = tokenizer_decode(&tokenizer, next_token);
-                    safe_printf(token_str);
-                } else {
-                    // fall back to printing the token id
-                    printf("%d ", next_token);
-                }
-                fflush(stdout);
-            }
-            printf("\n---\n");
-        }
+        // DISABLED FOR PROFILING: sampling generates many extra forward passes
+        // if (step > 0 && step % sample_every == 0 || last_step) {
+        //     // fill up gen_tokens with the GPT2_EOT, which kicks off the generation
+        //     for(int i = 0; i < B * T; ++i) {
+        //         gen_tokens[i] = GPT2_EOT;
+        //     }
+        //     // now sample from the model autoregressively
+        //     printf("generating:\n---\n");
+        //     for (int t = 1; t < genT; t++) {
+        //         // note that inference is very wasteful here because for each token
+        //         // we re-calculate the forward pass for all of (B,T) positions from scratch
+        //         // but the inference here is just for sanity checking anyway
+        //         // and we can maybe optimize a bit more later, with careful tests
+        //         gpt2_forward(&model, gen_tokens, NULL, B, T);
+        //         // furthermore, below we're only using b=0 (i.e. the first row) of all B rows
+        //         // we're in principle running B "inference streams" in parallel here
+        //         // only using position 0 because it's a bit faster (copy less probs from GPU -> CPU)
+        //         // get the V-dimensional vector probs[0, t-1, :]
+        //         float* logits = model.acts.output + (t - 1) * model.config.padded_vocab_size;
+        //         // move probs back to CPU and sample (note we only move the first vocab_size logits, ignoring the padding)
+        //         cudaCheck(cudaMemcpy(cpu_logits, logits, model.config.vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
+        //         float coin = random_f32(&rng_state);
+        //         int next_token = sample_softmax(cpu_logits, model.config.vocab_size, coin);
+        //         gen_tokens[t] = next_token;
+        //         // print the generated token, either using the Tokenizer or a fallback
+        //         if (tokenizer.init_ok) {
+        //             const char* token_str = tokenizer_decode(&tokenizer, next_token);
+        //             safe_printf(token_str);
+        //         } else {
+        //             // fall back to printing the token id
+        //             printf("%d ", next_token);
+        //         }
+        //         fflush(stdout);
+        //     }
+        //     printf("\n---\n");
+        // }
 
         // bit confusing: we want to make sure to eval and sample on 0th iteration
         // but also after the very last iteration. so we loop for step <= train_num_batches
