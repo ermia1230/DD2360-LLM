@@ -730,23 +730,24 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
     const int softmax_kernel_number = 2;
     switch (softmax_kernel_number)
     {
-    case 1:
+    case 1: {
         const int softmax_block_size = 256;
         const int softmax_grid_size = CEIL_DIV(T, softmax_block_size);
         softmax_autoregressive_backward_kernel1<<<dim3(softmax_grid_size, 1), softmax_block_size>>>(dpreatt, datt, att, B, T, C, NH);
         break;
-
-    case 2:
+    }
+    case 2: {
         const int softmax_block_size = 256;
         const dim3 softmax_grid_size(CEIL_DIV(T, softmax_block_size), NH, B);
         softmax_autoregressive_backward_kernel2<<<softmax_grid_size, softmax_block_size>>>(dpreatt, datt, att, B, T, C, NH);
         break;
-    
-    default:
+    }
+    default: {
         const int softmax_block_size = 256;
         const int softmax_grid_size = CEIL_DIV(T, softmax_block_size);
         softmax_autoregressive_backward_kernel1<<<dim3(softmax_grid_size, 1), softmax_block_size>>>(dpreatt, datt, att, B, T, C, NH);
         break;
+    }
     }
     cudaCheck(cudaGetLastError());
     // backward into q
