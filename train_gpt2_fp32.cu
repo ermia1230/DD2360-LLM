@@ -408,6 +408,32 @@ __global__ void softmax_autoregressive_backward_kernel1(float* dpreatt, const fl
     }
 }
 
+// Paralelize batches and heads
+__global__ void softmax_autoregressive_backward_kernel2(float* dpreatt, const float* datt, const float* att,
+                                                     int B, int T, int C, int NH) {
+    // dpreatt, datt, att are all (B, NH, T, T)
+    int t3 = blockIdx.x * blockDim.x + threadIdx.x;
+    int h = blockIdx.y;
+    int b = blockIdx.z;
+
+    if (b < B && h < NH && t3 < T) {
+        int hs = C / NH; // head size
+        float scale = 1.0f / sqrtf(hs);
+        for (int t = t3; t < T; t++) {
+            const float* att_bth = att + b*NH*T*T + h*T*T + t*T;
+            const float* datt_bth = datt + b*NH*T*T + h*T*T + t*T;
+            float* dpreatt_bth = dpreatt + b*NH*T*T + h*T*T + t*T;
+            float accum = 0.0f;
+            for (int t2 = 0; t2 <= t; t2++) {
+                float indicator = t2 == t3 ? 1.0f : 0.0f;
+                float local_derivative = att_bth[t2] * (indicator - att_bth[t3]);
+                accum +=  scale * local_derivative * datt_bth[t2];
+            }
+            dpreatt_bth[t3] = accum;
+        }
+    }
+}
+
 // naive fused kernel
 __global__ void adamw_kernel1(float* params_memory, const float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
                               float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
@@ -701,9 +727,27 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
     // backward into dv
     cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, HS, T, T, &one, scratch, HS, T * HS, att, T, T * T, &zero, dv, HS, T * HS, B * NH));
     // backward into preatt
-    const int softmax_block_size = 256;
-    const int softmax_grid_size = CEIL_DIV(T, softmax_block_size);
-    softmax_autoregressive_backward_kernel1<<<dim3(softmax_grid_size, 1), softmax_block_size>>>(dpreatt, datt, att, B, T, C, NH);
+    const int softmax_kernel_number = 2;
+    switch (softmax_kernel_number)
+    {
+    case 1:
+        const int softmax_block_size = 256;
+        const int softmax_grid_size = CEIL_DIV(T, softmax_block_size);
+        softmax_autoregressive_backward_kernel1<<<dim3(softmax_grid_size, 1), softmax_block_size>>>(dpreatt, datt, att, B, T, C, NH);
+        break;
+
+    case 2:
+        const int softmax_block_size = 256;
+        const dim3 softmax_grid_size(CEIL_DIV(T, softmax_block_size), NH, B);
+        softmax_autoregressive_backward_kernel2<<<softmax_grid_size, softmax_block_size>>>(dpreatt, datt, att, B, T, C, NH);
+        break;
+    
+    default:
+        const int softmax_block_size = 256;
+        const int softmax_grid_size = CEIL_DIV(T, softmax_block_size);
+        softmax_autoregressive_backward_kernel1<<<dim3(softmax_grid_size, 1), softmax_block_size>>>(dpreatt, datt, att, B, T, C, NH);
+        break;
+    }
     cudaCheck(cudaGetLastError());
     // backward into q
     cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, HS, T, T, &one, k, HS, T * HS, dpreatt, T, T * T, &zero, dq, HS, T * HS, B * NH));
