@@ -1019,8 +1019,8 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
         break;
     }
     default: {
-        printf("Unknown SOFTMAX_BACKWARD_KERNEL %d\n", SOFTMAX_BACKWARD_KERNEL);
-        break;
+        printf("Invalid SOFTMAX_BACKWARD_KERNEL %d\n", SOFTMAX_BACKWARD_KERNEL);
+        exit(1);
     }
     }
     cudaCheck(cudaGetLastError());
