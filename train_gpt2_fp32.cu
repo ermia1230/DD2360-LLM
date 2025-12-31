@@ -33,6 +33,10 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 // defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
 #include "llmc/dataloader.h"
 
+// Define kernels to use
+#define SOFTMAX_BACKWARD_KERNEL 2
+
+
 // ----------------------------------------------------------------------------
 // CUDA utils
 
@@ -969,8 +973,7 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
     // backward into dv
     cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, HS, T, T, &one, scratch, HS, T * HS, att, T, T * T, &zero, dv, HS, T * HS, B * NH));
     // backward into preatt
-    const int softmax_kernel_number = 2;
-    switch (softmax_kernel_number)
+    switch (SOFTMAX_BACKWARD_KERNEL)
     {
     case 1: {
         const int softmax_block_size = 256;
