@@ -1056,7 +1056,8 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
         const int hs = C / NH;
         const float scale = 1.0f / sqrtf(hs);
         const dim3 softmax_grid_size(CEIL_DIV(T, softmax_block_size), T, NH * B);
-        softmax_autoregressive_backward_kernel4<<<softmax_grid_size, softmax_block_size>>>(dpreatt, datt, att, B, T, NH, hs, scale);
+        size_t shared_mem_size = 2 * T * sizeof(float);
+        softmax_autoregressive_backward_kernel4<<<softmax_grid_size, softmax_block_size, shared_mem_size>>>(dpreatt, datt, att, B, T, NH, hs, scale);
         break;
     }
     default: {
