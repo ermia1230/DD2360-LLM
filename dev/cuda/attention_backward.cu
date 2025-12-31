@@ -744,7 +744,7 @@ __global__ void softmax_autoregressive_backward_kernel_o1(float* dpreatt, const 
 }
 
 // Parallelize sequences
-__global__ void softmax_autoregressive_backward_kernelo2(float* dpreatt, const float* datt, const float* att,
+__global__ void softmax_autoregressive_backward_kernel_o2(float* dpreatt, const float* datt, const float* att,
                                                      int B, int T, int NH, int hs, float scale) {
     // dpreatt, datt, att are all (B, NH, T, T)
     int t3 = blockIdx.x * blockDim.x + threadIdx.x;
@@ -767,7 +767,7 @@ __global__ void softmax_autoregressive_backward_kernelo2(float* dpreatt, const f
 }
 
 // Implement shared memory
-__global__ void softmax_autoregressive_backward_kernel4(float* dpreatt, const float* datt, const float* att,
+__global__ void softmax_autoregressive_backward_kernel_o3(float* dpreatt, const float* datt, const float* att,
                                                      int B, int T, int NH, int hs, float scale) {
 
     extern __shared__ float shared_mem[];
@@ -944,7 +944,7 @@ void launch_softmax_o2(float* dpreatt, float* datt, const float* att, int B, int
     float scale = 1.0f / sqrtf(hs);
     int num_blocks_x = ceil_div(T, block_size);
     dim3 grid_size(num_blocks_x, T, B * NH);
-    softmax_autoregressive_backward_kernelo2<<<grid_size, block_size>>>(dpreatt, datt, att, B, T, NH, hs, scale);
+    softmax_autoregressive_backward_kernel_o2<<<grid_size, block_size>>>(dpreatt, datt, att, B, T, NH, hs, scale);
 }
 
 void launch_softmax_o3(float* dpreatt, float* datt, const float* att, int B, int T, int C, int NH, int block_size) {
@@ -953,7 +953,7 @@ void launch_softmax_o3(float* dpreatt, float* datt, const float* att, int B, int
     size_t shared_mem_size = 2 * T * sizeof(float);
     int num_blocks_x = ceil_div(T, block_size);
     dim3 grid_size(num_blocks_x, T, B * NH);
-    softmax_autoregressive_backward_kernel4<<<grid_size, block_size, shared_mem_size>>>(dpreatt, datt, att, B, T, NH, hs, scale);
+    softmax_autoregressive_backward_kernel_o3<<<grid_size, block_size, shared_mem_size>>>(dpreatt, datt, att, B, T, NH, hs, scale);
 }
 
 // the sequence of transformations in this compound op is:
