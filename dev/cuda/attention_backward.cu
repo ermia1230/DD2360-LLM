@@ -1040,6 +1040,7 @@ void attention_backward(int kernel_num,
         case 12:
             attention_backward1(dinp, dqkvr, dpreatt, datt, dvaccum, dout, inp, qkvr, preatt, att, vaccum, B, T, C, NH,
                                 launch_softmax_o2, block_size);
+            break;
         default:
             printf("Invalid kernel number\n");
             exit(1);
