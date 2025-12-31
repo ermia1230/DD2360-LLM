@@ -743,6 +743,28 @@ __global__ void softmax_autoregressive_backward_kernel_o1(float* dpreatt, const 
     }
 }
 
+__global__ void softmax_autoregressive_backward_kernelo2(float* dpreatt, const float* datt, const float* att,
+                                                     int B, int T, int NH, int hs, float scale) {
+    // dpreatt, datt, att are all (B, NH, T, T)
+    int t3 = blockIdx.x * blockDim.x + threadIdx.x;
+    int t = blockIdx.y;
+    int h = blockIdx.z % NH;
+    int b = blockIdx.z / NH;
+
+    if (b < B && h < NH && t3 < T && t>=t3 && t < T) {
+        const float* att_bth = att + b*NH*T*T + h*T*T + t*T;
+        const float* datt_bth = datt + b*NH*T*T + h*T*T + t*T;
+        float* dpreatt_bth = dpreatt + b*NH*T*T + h*T*T + t*T;
+        float accum = 0.0f;
+        for (int t2 = 0; t2 <= t; t2++) {
+            float indicator = t2 == t3 ? 1.0f : 0.0f;
+            float local_derivative = att_bth[t2] * (indicator - att_bth[t3]);
+            accum +=  scale * local_derivative * datt_bth[t2];
+        }
+        dpreatt_bth[t3] = accum;
+    }
+}
+
 
 // ----------------------------------------------------------------------------
 // kernel launchers
@@ -883,6 +905,14 @@ void launch_softmax_o1(float* dpreatt, float* datt, const float* att, int B, int
     softmax_autoregressive_backward_kernel_o1<<<grid_size, block_size>>>(dpreatt, datt, att, B, T, C, NH);
 }
 
+void launch_softmax_o2(float* dpreatt, float* datt, const float* att, int B, int T, int C, int NH, int block_size) {
+    int hs = C / NH; // head size
+    float scale = 1.0f / sqrtf(hs);
+    int num_blocks_x = ceil_div(T, block_size);
+    dim3 grid_size(num_blocks_x, T, B * NH);
+    softmax_autoregressive_backward_kernelo2<<<grid_size, block_size>>>(dpreatt, datt, att, B, T, NH, hs, scale);
+}
+
 // the sequence of transformations in this compound op is:
 // inp (B,T,3C) -> qkvr (B,T,3C) -> preatt (B,NH,T,T) -> att (B,NH,T,T) -> vaccum (B,T,C) -> out (B,T,C)
 template<class SoftmaxKernel>
@@ -1007,6 +1037,9 @@ void attention_backward(int kernel_num,
             attention_backward1(dinp, dqkvr, dpreatt, datt, dvaccum, dout, inp, qkvr, preatt, att, vaccum, B, T, C, NH,
                                 launch_softmax_o1, block_size);
             break;
+        case 12:
+            attention_backward1(dinp, dqkvr, dpreatt, datt, dvaccum, dout, inp, qkvr, preatt, att, vaccum, B, T, C, NH,
+                                launch_softmax_o2, block_size);
         default:
             printf("Invalid kernel number\n");
             exit(1);
