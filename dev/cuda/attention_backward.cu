@@ -743,6 +743,7 @@ __global__ void softmax_autoregressive_backward_kernel_o1(float* dpreatt, const 
     }
 }
 
+// Parallelize sequences
 __global__ void softmax_autoregressive_backward_kernelo2(float* dpreatt, const float* datt, const float* att,
                                                      int B, int T, int NH, int hs, float scale) {
     // dpreatt, datt, att are all (B, NH, T, T)
@@ -760,6 +761,39 @@ __global__ void softmax_autoregressive_backward_kernelo2(float* dpreatt, const f
             float indicator = t2 == t3 ? 1.0f : 0.0f;
             float local_derivative = att_bth[t2] * (indicator - att_bth[t3]);
             accum +=  scale * local_derivative * datt_bth[t2];
+        }
+        dpreatt_bth[t3] = accum;
+    }
+}
+
+// Implement shared memory
+__global__ void softmax_autoregressive_backward_kernel4(float* dpreatt, const float* datt, const float* att,
+                                                     int B, int T, int NH, int hs, float scale) {
+
+    extern __shared__ float shared_mem[];
+    float* att_shared = shared_mem; // size T
+    float* datt_shared = &shared_mem[T]; // size T
+
+    // dpreatt, datt, att are all (B, NH, T, T)
+    int t3 = blockIdx.x * blockDim.x + threadIdx.x;
+    int t = blockIdx.y;
+    int h = blockIdx.z % NH;
+    int b = blockIdx.z / NH;
+
+    // Fill shared memory
+    for (int i = threadIdx.x; i < T; i += blockDim.x) {
+        att_shared[i] = att[b*NH*T*T + h*T*T + t*T + i];
+        datt_shared[i] = datt[b*NH*T*T + h*T*T + t*T + i];
+    }
+    __syncthreads();
+
+    if (b < B && h < NH && t3 < T && t>=t3 && t < T) {
+        float* dpreatt_bth = dpreatt + b*NH*T*T + h*T*T + t*T;
+        float accum = 0.0f;
+        for (int t2 = 0; t2 <= t; t2++) {
+            float indicator = t2 == t3 ? 1.0f : 0.0f;
+            float local_derivative = att_shared[t2] * (indicator - att_shared[t3]);
+            accum +=  scale * local_derivative * datt_shared[t2];
         }
         dpreatt_bth[t3] = accum;
     }
@@ -913,6 +947,15 @@ void launch_softmax_o2(float* dpreatt, float* datt, const float* att, int B, int
     softmax_autoregressive_backward_kernelo2<<<grid_size, block_size>>>(dpreatt, datt, att, B, T, NH, hs, scale);
 }
 
+void launch_softmax_o3(float* dpreatt, float* datt, const float* att, int B, int T, int C, int NH, int block_size) {
+    int hs = C / NH; // head size
+    float scale = 1.0f / sqrtf(hs);
+    size_t shared_mem_size = 2 * T * sizeof(float);
+    int num_blocks_x = ceil_div(T, block_size);
+    dim3 grid_size(num_blocks_x, T, B * NH);
+    softmax_autoregressive_backward_kernel4<<<grid_size, block_size, shared_mem_size>>>(dpreatt, datt, att, B, T, NH, hs, scale);
+}
+
 // the sequence of transformations in this compound op is:
 // inp (B,T,3C) -> qkvr (B,T,3C) -> preatt (B,NH,T,T) -> att (B,NH,T,T) -> vaccum (B,T,C) -> out (B,T,C)
 template<class SoftmaxKernel>
@@ -1040,6 +1083,10 @@ void attention_backward(int kernel_num,
         case 12:
             attention_backward1(dinp, dqkvr, dpreatt, datt, dvaccum, dout, inp, qkvr, preatt, att, vaccum, B, T, C, NH,
                                 launch_softmax_o2, block_size);
+            break;
+        case 13:
+            attention_backward1(dinp, dqkvr, dpreatt, datt, dvaccum, dout, inp, qkvr, preatt, att, vaccum, B, T, C, NH,
+                                launch_softmax_o3, block_size);
             break;
         default:
             printf("Invalid kernel number\n");

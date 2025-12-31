@@ -34,7 +34,7 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 #include "llmc/dataloader.h"
 
 // Define kernels to use
-#define SOFTMAX_BACKWARD_KERNEL 2
+#define SOFTMAX_BACKWARD_KERNEL 4
 
 
 // ----------------------------------------------------------------------------
@@ -456,6 +456,39 @@ __global__ void softmax_autoregressive_backward_kernel3(float* dpreatt, const fl
             float indicator = t2 == t3 ? 1.0f : 0.0f;
             float local_derivative = att_bth[t2] * (indicator - att_bth[t3]);
             accum +=  scale * local_derivative * datt_bth[t2];
+        }
+        dpreatt_bth[t3] = accum;
+    }
+}
+
+// Implement shared memory
+__global__ void softmax_autoregressive_backward_kernel4(float* dpreatt, const float* datt, const float* att,
+                                                     int B, int T, int NH, int hs, float scale) {
+
+    extern __shared__ float shared_mem[];
+    float* att_shared = shared_mem; // size T
+    float* datt_shared = &shared_mem[T]; // size T
+
+    // dpreatt, datt, att are all (B, NH, T, T)
+    int t3 = blockIdx.x * blockDim.x + threadIdx.x;
+    int t = blockIdx.y;
+    int h = blockIdx.z % NH;
+    int b = blockIdx.z / NH;
+
+    // Fill shared memory
+    for (int i = threadIdx.x; i < T; i += blockDim.x) {
+        att_shared[i] = att[b*NH*T*T + h*T*T + t*T + i];
+        datt_shared[i] = datt[b*NH*T*T + h*T*T + t*T + i];
+    }
+    __syncthreads();
+
+    if (b < B && h < NH && t3 < T && t>=t3 && t < T) {
+        float* dpreatt_bth = dpreatt + b*NH*T*T + h*T*T + t*T;
+        float accum = 0.0f;
+        for (int t2 = 0; t2 <= t; t2++) {
+            float indicator = t2 == t3 ? 1.0f : 0.0f;
+            float local_derivative = att_shared[t2] * (indicator - att_shared[t3]);
+            accum +=  scale * local_derivative * datt_shared[t2];
         }
         dpreatt_bth[t3] = accum;
     }
@@ -1014,8 +1047,16 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
         const int softmax_block_size = 256;
         const int hs = C / NH;
         const float scale = 1.0f / sqrtf(hs);
-        const dim3 softmax_grid_size(CEIL_DIV(T, softmax_block_size), T,NH * B);
+        const dim3 softmax_grid_size(CEIL_DIV(T, softmax_block_size), T, NH * B);
         softmax_autoregressive_backward_kernel3<<<softmax_grid_size, softmax_block_size>>>(dpreatt, datt, att, B, T, NH, hs, scale);
+        break;
+    }
+    case 4: {
+        const int softmax_block_size = 256;
+        const int hs = C / NH;
+        const float scale = 1.0f / sqrtf(hs);
+        const dim3 softmax_grid_size(CEIL_DIV(T, softmax_block_size), T, NH * B);
+        softmax_autoregressive_backward_kernel4<<<softmax_grid_size, softmax_block_size>>>(dpreatt, datt, att, B, T, NH, hs, scale);
         break;
     }
     default: {
