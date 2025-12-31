@@ -551,6 +551,191 @@ __global__ void matmul_forward_kernel1(float* out,
     }
 }
 
+// kernel 5: naive kernel with tilling and GEMM structure
+#define TILE_M 16
+#define TILE_N 16
+__global__ void matmul_forward_kernel5(float* out, //output matrix [BT, OC]
+                                       const float* inp, // input matrix [BT, C]
+                                       const float* weight, // weight matrix [OC, C]
+                                       const float* bias, // bias vector [OC]
+                                       int BT, int C, int OC) {
+
+    // Thread coordinates in block
+    int ty = threadIdx.y; // row within the block
+    int tx = threadIdx.x; // column within the block
+
+    // Map threads to matrix rows and columns
+    int bt = blockIdx.x * TILE_M + ty; // row index in output
+    int oc = blockIdx.y * TILE_N + tx; // column index in output
+    
+    if (bt < BT && oc < OC) {
+        float val = (bias != NULL) ? bias[oc]: 0.0f;
+
+        const float* wrow = weight + oc * C; // point to the start of the weight row
+        const float* inp_bt = inp + bt * C; // point to the start of the input row
+
+        for (int i = 0; i < C; i++){
+            val += inp_bt[i] * wrow[i];
+        }
+
+        out[bt * OC + oc] = val;
+    }
+}
+
+// kernel 6: kernel 5 with shared memory and memory coalescing
+#define TILE_K 32
+
+__global__ void matmul_forward_kernel6(float* out, //output matrix [BT, OC]
+                                       const float* inp, // input matrix [BT, C]
+                                       const float* weight, // weight matrix [OC, C]
+                                       const float* bias, // bias vector [OC]
+                                       int BT, int C, int OC) {
+     
+    // Shared memory
+    __shared__ float inp_s[TILE_M][TILE_K]; // input tile
+    __shared__ float weight_s[TILE_N][TILE_K]; // weight tile
+    
+    // Thread coordinates in block
+    int ty = threadIdx.y; // row within the block
+    int tx = threadIdx.x; // column within the block
+
+    // Map threads to matrix rows and columns
+    int bt = blockIdx.x * TILE_M + ty; // row index in output
+    int oc = blockIdx.y * TILE_N + tx; // column index in output
+
+    float val = 0.0f; // accumulator for the dot product
+    
+    // Total number of threads in the block
+    int num_threads = TILE_M * TILE_N;
+    // Unique thread ID within the block
+    int thread_id = ty * TILE_N + tx;
+    
+    // Loop over tiles of K dimension
+    for (int k0 = 0; k0 < C; k0 += TILE_K) {
+
+        // Load input tile into shared memory with coalesced access
+        int inp_elems = TILE_M * TILE_K;
+        for (int i = thread_id; i < inp_elems; i += num_threads) {
+            int row = i / TILE_K;
+            int col = i % TILE_K;
+            int global_row = blockIdx.x * TILE_M + row;
+            int global_col = k0 + col;
+            if (global_row < BT && global_col < C) {
+                inp_s[row][col] = inp[global_row * C + global_col];
+            } else {
+                inp_s[row][col] = 0.0f;
+            }
+        }
+
+        // Load weight tile into shared memory with coalesced access
+        int weight_elems = TILE_N * TILE_K;
+        for (int i = thread_id; i < weight_elems; i += num_threads) {
+            int row = i / TILE_K;
+            int col = i % TILE_K;
+            int global_row = blockIdx.y * TILE_N + row;
+            int global_col = k0 + col;          
+            if (global_row < OC && global_col < C) {
+                weight_s[row][col] = weight[global_row * C + global_col];
+            } else {
+                weight_s[row][col] = 0.0f;
+            }
+        }
+
+        // Synchronize to make sure the tile is loaded
+        __syncthreads();
+
+        // Compute partial dot product using the shared memory tile
+        for (int k = 0; k < TILE_K; k++) {
+            val += inp_s[ty][k] * weight_s[tx][k];
+        }
+
+        // Synchronize before loading the next tile
+        __syncthreads();
+
+    }
+
+    if (bt < BT && oc < OC) {
+        val += (bias != NULL) ? bias[oc]: 0.0f;
+        out[bt * OC + oc] = val;
+    }
+}
+
+// kernel 7: kernel 6 with loop unrolling
+__global__ void matmul_forward_kernel7(float* out, //output matrix [BT, OC]
+                                       const float* inp, // input matrix [BT, C]
+                                       const float* weight, // weight matrix [OC, C]
+                                       const float* bias, // bias vector [OC]
+                                       int BT, int C, int OC) {
+     
+    // Shared memory
+    __shared__ float inp_s[TILE_M][TILE_K]; // input tile
+    __shared__ float weight_s[TILE_N][TILE_K]; // weight tile
+    
+    // Thread coordinates in block
+    int ty = threadIdx.y; // row within the block
+    int tx = threadIdx.x; // column within the block
+
+    // Map threads to matrix rows and columns
+    int bt = blockIdx.x * TILE_M + ty; // row index in output
+    int oc = blockIdx.y * TILE_N + tx; // column index in output
+
+    float val = 0.0f; // accumulator for the dot product
+    
+    // Total number of threads in the block
+    int num_threads = TILE_M * TILE_N;
+    // Unique thread ID within the block
+    int thread_id = ty * TILE_N + tx;
+    
+    // Loop over tiles of K dimension
+    for (int k0 = 0; k0 < C; k0 += TILE_K) {
+
+        // Load input tile into shared memory with coalesced access
+        int inp_elems = TILE_M * TILE_K;
+        for (int i = thread_id; i < inp_elems; i += num_threads) {
+            int row = i / TILE_K;
+            int col = i % TILE_K;
+            int global_row = blockIdx.x * TILE_M + row;
+            int global_col = k0 + col;
+            if (global_row < BT && global_col < C) {
+                inp_s[row][col] = inp[global_row * C + global_col];
+            } else {
+                inp_s[row][col] = 0.0f;
+            }
+        }
+
+        // Load weight tile into shared memory with coalesced access
+        int weight_elems = TILE_N * TILE_K;
+        for (int i = thread_id; i < weight_elems; i += num_threads) {
+            int row = i / TILE_K;
+            int col = i % TILE_K;
+            int global_row = blockIdx.y * TILE_N + row;
+            int global_col = k0 + col;          
+            if (global_row < OC && global_col < C) {
+                weight_s[row][col] = weight[global_row * C + global_col];
+            } else {
+                weight_s[row][col] = 0.0f;
+            }
+        }
+
+        // Synchronize to make sure the tile is loaded
+        __syncthreads();
+
+        // Compute partial dot product using the shared memory tile
+        #pragma unroll
+        for (int k = 0; k < TILE_K; k++) {
+            val += inp_s[ty][k] * weight_s[tx][k];
+        }
+
+        // Synchronize before loading the next tile
+        __syncthreads();
+
+    }
+
+    if (bt < BT && oc < OC) {
+        val += (bias != NULL) ? bias[oc]: 0.0f;
+        out[bt * OC + oc] = val;
+    }
+}
 
 // ----------------------------------------------------------------------------
 // kernel launchers
@@ -586,7 +771,7 @@ void layernorm_forward(float* out, float* mean, float* rstd,
 }
 
 // kernel 1 is the most naive matmul kernel
-void matmul_forward(float* out,
+void matmul_forward1(float* out,
                     const float* inp, const float* weight, const float* bias,
                     int B, int T, int C, int OC) {
     // out is (B,T,OC). OC is short for "output channels", e.g. OC = 4 * C
@@ -595,6 +780,63 @@ void matmul_forward(float* out,
     dim3 gridDim(CEIL_DIV(BT, 16), CEIL_DIV(OC, 16));
     dim3 blockDim(16, 16);
     matmul_forward_kernel1<<<gridDim, blockDim>>>(out, inp, weight, bias, BT, C, OC);
+    cudaCheck(cudaGetLastError());
+}
+
+// kernel 5 is a naive kernel with tiling
+void matmul_forward5(float* out,
+                     const float* inp, const float* weight, const float* bias,
+                     int B, int T, int C, int OC) {
+
+    int BT = B * T;
+
+    dim3 blockDim(TILE_N, TILE_M);
+    dim3 gridDim(
+        ceil_div(BT, TILE_M),
+        ceil_div(OC, TILE_N)
+    );
+
+    matmul_forward_kernel5<<<gridDim, blockDim>>>(
+        out, inp, weight, bias, BT, C, OC
+    );
+    cudaCheck(cudaGetLastError());
+}
+
+// kernel 6 is a naive kernel with tiling, shared memory and memory coalescing 
+void matmul_forward6(float* out,
+                     const float* inp, const float* weight, const float* bias,
+                     int B, int T, int C, int OC) {
+
+    int BT = B * T;
+
+    dim3 blockDim(TILE_N, TILE_M);
+    dim3 gridDim(
+        ceil_div(BT, TILE_M),
+        ceil_div(OC, TILE_N)
+    );
+
+    matmul_forward_kernel7<<<gridDim, blockDim>>>(
+        out, inp, weight, bias, BT, C, OC
+    );
+    cudaCheck(cudaGetLastError());
+}
+
+// kernel 7 is kernel 6 with loop unrolling (identical launcher to 7)
+void matmul_forward7(float* out,
+                     const float* inp, const float* weight, const float* bias,
+                     int B, int T, int C, int OC) {
+
+    int BT = B * T;
+
+    dim3 blockDim(TILE_N, TILE_M);
+    dim3 gridDim(
+        ceil_div(BT, TILE_M),
+        ceil_div(OC, TILE_N)
+    );
+
+    matmul_forward_kernel7<<<gridDim, blockDim>>>(
+        out, inp, weight, bias, BT, C, OC
+    );
     cudaCheck(cudaGetLastError());
 }
 
@@ -1158,20 +1400,20 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
 
         // now do the forward pass
         layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
-        matmul_forward(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
+        matmul_forward7(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
         attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH);
-        matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
+        matmul_forward7(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
         residual_forward(l_residual2, residual, l_attproj, B*T*C);
         layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
-        matmul_forward(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
+        matmul_forward7(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
         gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
-        matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
+        matmul_forward7(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
         residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
     }
 
     residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
-    matmul_forward(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp);
+    matmul_forward7(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp);
 
     // also forward the cross-entropy loss function if we have the targets
     if (targets != NULL) {

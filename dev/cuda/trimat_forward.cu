@@ -134,7 +134,7 @@ __global__ void permute_kernel(float* q, float* k, float* v,
     }
 }
 
-
+#if 0
 void trimul_cublas(float* preatt,
                    const float* inp,
                    int B, int T, int C, int NH) {
@@ -192,6 +192,7 @@ void trimul_cublas(float* preatt,
                                           preatt, T, T * T,
                                           B * NH));
 }
+#endifq
 
 /*                    ** Chapter II - Getting a Team **
  *
@@ -339,6 +340,7 @@ __device__ void matmul_tri_naive(float* p, int PS, const float* k, int KS, const
  *  A different strategy is needed, then.
  */
 
+ #if 0
 // reorganize loops to enable data reuse: 3.5 ms
 __device__ void matmul_tri_registers(float* p, int PS, const float* k, int KS, const float* q, int QS, int T, int HS, float alpha) {
     int i_base = 128 * blockIdx.x + 8 * threadIdx.x;
@@ -374,6 +376,7 @@ __device__ void matmul_tri_registers(float* p, int PS, const float* k, int KS, c
         }
     }
 }
+#endif
 
 /*                     ** Chapter IV - By the Bucketload **
  *
@@ -411,6 +414,7 @@ __device__ void st_vec(float* address, float4 val) {
     *reinterpret_cast<float4*>(address) = val;
 }
 
+#if 0
 // vector instructions for coalesced memory access: 1.7 ms
 __device__ void matmul_tri3(float* p, int PS, const float* k, int KS, const float* q, int QS, int T, int HS, float alpha) {
     // Same logic as previous kernel we just load in float4 to improve coalescing
@@ -456,6 +460,7 @@ __device__ void matmul_tri3(float* p, int PS, const float* k, int KS, const floa
         }
     }
 }
+#endif
 
 /*                     ** Chapter V - Sharing is Caring **
  *
@@ -473,6 +478,8 @@ __device__ void matmul_tri3(float* p, int PS, const float* k, int KS, const floa
  *  details.]
  *
  */
+
+ #if 0
 __device__ void matmul_tri4(float* p, int PS, const float* k, int KS, const float* q, int QS, int T, int HS, float alpha) {
     int i_base = 128 * blockIdx.x + 8 * threadIdx.x;
     int j_base = 128 * blockIdx.y + 8 * threadIdx.y;
@@ -546,6 +553,7 @@ __device__ void matmul_tri4(float* p, int PS, const float* k, int KS, const floa
         }
     }
 }
+#endif
 
 /*                     ** Chapter VI - Competition Day **
  *

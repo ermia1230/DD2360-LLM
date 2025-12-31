@@ -76,6 +76,7 @@ __global__ void matmul_backward_bias_kernel_naive(float* dbias, const float* dou
     }
 }
 
+#if 0
 // use shared memory and coarsening + reductions
 __global__ void matmul_backward_bias_kernel_faster(float* dbias, const float* dout, int B, int T, int OC) {
     extern __shared__ float shared[];
@@ -102,7 +103,7 @@ __global__ void matmul_backward_bias_kernel_faster(float* dbias, const float* do
         dbias[o] = shared[0];
     }
 }
-
+#endif
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -233,9 +234,9 @@ int main(int argc, char **argv) {
 
     // read kernel_num from command line
     int kernel_num = 1;
-    if (argc > 1) {
-        kernel_num = atoi(argv[1]);
-    }
+    //if (argc > 1) {
+      //  kernel_num = atoi(argv[1]);
+    //}
     printf("Using kernel %d\n", kernel_num);
 
     // calculate the CPU reference

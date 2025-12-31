@@ -121,6 +121,7 @@ __global__ void softmax_forward_kernel1(float* out, const float* inp, int N, int
     }
 }
 
+#if 0
 __global__ void softmax_forward_kernel2(float* out, const float* inp, int N, int C) {
     // inp is (N, C)
     // in each row of C elements, first calculates maxval, then returns expf(val - maxval)
@@ -171,6 +172,7 @@ __global__ void softmax_forward_kernel2(float* out, const float* inp, int N, int
         out[idx * C + i] = x[i] / sum;
     }
 }
+#endif
 
 // warp-level reduction for finding the maximum value
 __device__ float warpReduceMax(float val) {
@@ -180,6 +182,7 @@ __device__ float warpReduceMax(float val) {
     return val;
 }
 
+#if 0
 __global__ void softmax_forward_kernel3(float* out, const float* inp, int N, int C) {
     // kernel must use block size of 32
     extern __shared__ float shared[];
@@ -217,7 +220,9 @@ __global__ void softmax_forward_kernel3(float* out, const float* inp, int N, int
         out[idx * C + i] = x[i] / sumval;
     }
 }
+#endif
 
+#if 0
 __global__ void softmax_forward_kernel4(float* out, const float* inp, int N, int C) {
     // out is (N, C) just like inp. Each row of inp will get softmaxed.
     // same as kernel3, but can handle any block size (multiple of 32)
@@ -305,7 +310,9 @@ __global__ void softmax_forward_kernel4(float* out, const float* inp, int N, int
         out[idx * C + i] = x[i] / sum;
     }
 }
+#endif
 
+#if 0
 __global__ void softmax_forward_online_kernel1(float* out, const float* inp, int N, int C) {
     // inp is (N, C)
     // out is (N, C), each row of inp will get softmaxed
@@ -333,6 +340,7 @@ __global__ void softmax_forward_online_kernel1(float* out, const float* inp, int
         }
     }
 }
+#endif
 
 // struct for the reduction operation, guarantees 8-byte alignment
 struct __align__(8) SumMax
@@ -352,6 +360,7 @@ __device__ __forceinline__ SumMax reduce_sum_max_op(SumMax a, SumMax b) {
     return res;
 }
 
+#if 0
 __global__ void softmax_forward_online_kernel2(float* out, const float* inp, int N, int C) {
 	namespace cg = cooperative_groups;
 	cg::thread_block block = cg::this_thread_block();
@@ -385,7 +394,9 @@ __global__ void softmax_forward_online_kernel2(float* out, const float* inp, int
         __stcs(out + idx * C + i, expf(x[i] - sm_total.maxval) / sm_total.sum);
 	}
 }
+#endif
 
+#if 0
 __global__ void softmax_forward_kernel7(float* out, const float* inp, int N, int C) {
     // out is (N, C) just like inp. Each row of inp will get softmaxed.
     // same as kernel4, but optimised for very large Cs with advanced unrolling
@@ -502,7 +513,9 @@ __global__ void softmax_forward_kernel7(float* out, const float* inp, int N, int
         }
     }
 }
+#endif
 
+#if 0
 __global__ void softmax_forward_online_kernel8(float* out, const float* inp, int N, int C) {
     // online softmax paper: http://arxiv.org/abs/1805.02867
     // online softmax reduces loops from 3 to 2
@@ -562,7 +575,7 @@ __global__ void softmax_forward_online_kernel8(float* out, const float* inp, int
         y[i] = expf(x[i] - maxval) / sumval;
     }
 }
-
+#endif
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -572,49 +585,57 @@ void softmax_forward1(float* out, const float* inp, int N, int C, const int bloc
     cudaCheck(cudaGetLastError());
 }
 
+#if 0
 void softmax_forward2(float* out, const float* inp, int N, int C, const int block_size) {
     int grid_size = N;
     size_t shared_mem_size = block_size * sizeof(float);
     softmax_forward_kernel2<<<grid_size, block_size, shared_mem_size>>>(out, inp, N, C);
 }
-
+#endif
+#if 0
 void softmax_forward3(float* out, const float* inp, int N, int C, int block_size) {
     block_size = 32; // awkward but ok. this one only works with block size 32
     int grid_size = N;
     size_t shared_mem_size = block_size * sizeof(float);
     softmax_forward_kernel3<<<grid_size, block_size, shared_mem_size>>>(out, inp, N, C);
 }
-
+#endif
+#if 0
 void softmax_forward4(float* out, const float* inp, int N, int C, int block_size) {
     int grid_size = N;
     // for each warp in the block we need a float that will be used for both maxval and sumval
     size_t shared_mem_size = block_size / 32 * sizeof(float);
     softmax_forward_kernel4<<<grid_size, block_size, shared_mem_size>>>(out, inp, N, C);
 }
-
+#endif
+#if 0
 void softmax_forward_online1(float* out, const float* inp, int N, int C, int block_size) {
     const int grid_size = ceil_div(N, block_size);
     softmax_forward_online_kernel1 <<<grid_size, block_size >>> (out, inp, N, C);
     cudaCheck(cudaGetLastError());
 }
-
+#endif
+#if 0
 void softmax_forward_online2(float* out, const float* inp, int N, int C, int block_size) {
     const int grid_size = ceil_div(N * 32, block_size);
     softmax_forward_online_kernel2 <<<grid_size, block_size >>> (out, inp, N, C);
     cudaCheck(cudaGetLastError());
 }
-
+#endif
+#if 0
 void softmax_forward7(float* out, const float* inp, int N, int C, int block_size) {
     int grid_size = N;
     size_t shared_mem_size = 2 * block_size / 32 * sizeof(float);
     softmax_forward_kernel7<<<grid_size, block_size, shared_mem_size>>>(out, inp, N, C);
 }
-
+#endif
+#if 0
 void softmax_forward_online8(float* out, const float* inp, int N, int C, int block_size) {
     const int grid_size = ceil_div(N * 32, block_size);
     softmax_forward_online_kernel8<<<grid_size, block_size>>>(out, inp, N, C);
     cudaCheck(cudaGetLastError());
 }
+#endif
 
 // kernel version dispatch
 void softmax_forward(int kernel_num, float* out, const float* inp, int N, int C, const int block_size) {
@@ -622,27 +643,27 @@ void softmax_forward(int kernel_num, float* out, const float* inp, int N, int C,
         case 1:
             softmax_forward1(out, inp, N, C, block_size);
             break;
-        case 2:
-            softmax_forward2(out, inp, N, C, block_size);
-            break;
-        case 3:
-            softmax_forward3(out, inp, N, C, block_size);
-            break;
-        case 4:
-            softmax_forward4(out, inp, N, C, block_size);
-            break;
-        case 5:
-            softmax_forward_online1(out, inp, N, C, block_size);
-            break;
-        case 6:
-            softmax_forward_online2(out, inp, N, C, block_size);
-            break;
-        case 7:
-            softmax_forward7(out, inp, N, C, block_size);
-            break;
-        case 8:
-            softmax_forward_online8(out, inp, N, C, block_size);
-            break;
+        //case 2:
+        //    softmax_forward2(out, inp, N, C, block_size);
+        //    break;
+        //case 3:
+        //    softmax_forward3(out, inp, N, C, block_size);
+        //    break;
+        //case 4:
+        //    softmax_forward4(out, inp, N, C, block_size);
+        //    break;
+        //case 5:
+        //    softmax_forward_online1(out, inp, N, C, block_size);
+        //    break;
+        //case 6:
+        //    softmax_forward_online2(out, inp, N, C, block_size);
+        //    break;
+        //case 7:
+        //    softmax_forward7(out, inp, N, C, block_size);
+        //    break;
+        //case 8:
+        //    softmax_forward_online8(out, inp, N, C, block_size);
+        //    break;
         default:
             printf("Invalid kernel number\n");
             exit(1);

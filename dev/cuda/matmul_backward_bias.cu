@@ -96,6 +96,7 @@ __global__ void matmul_backward_bias_kernel1(floatX* dbias, const floatX* dout, 
     }
 }
 
+#if 0
 // cooperative groups solution, one warp per output channel
 __global__ void matmul_backward_bias_kernel2(floatX* dbias, const floatX* dout, int B, int T, int OC) {
     // dout is (B, T, OC), dbias is (OC)
@@ -119,7 +120,8 @@ __global__ void matmul_backward_bias_kernel2(floatX* dbias, const floatX* dout, 
         dbias[idx] = (float)dbias[idx] + sum;
     }
 }
-
+#endif
+#if 0
 __global__ void matmul_backward_bias_kernel3(floatX* dbias, const floatX* dout, int B, int T, int OC) {
     // dout is (B, T, OC), dbias is (OC)
     // in this version of the kernel the entire block of block_size is dedicated to one output channel
@@ -152,7 +154,8 @@ __global__ void matmul_backward_bias_kernel3(floatX* dbias, const floatX* dout, 
         dbias[idx] = (float)dbias[idx] + block_sum;
     }
 }
-
+#endif
+#if 0
 // this kernel performs a column-wise reduction over dout, in PyTorch equivalent to:
 // dbias = dout.sum((0,1))
 // the idea is to employ one block to reduce along several columns,
@@ -192,6 +195,7 @@ __global__ void matmul_backward_bias_kernel4(floatX* dbias, const floatX* dout, 
         dbias[tl + lane_id] = (float)dbias[tl + lane_id] + dout_sum;
     }
 }
+#endif
 
 #ifndef ENABLE_BF16
 __global__ void matmul_backward_bias_kernel5(floatX* dbias, const floatX* dout, int B, int T, int OC) {
@@ -213,7 +217,7 @@ __global__ void cast_and_add_kernel(floatX* dst, const float* src, size_t n) {
     const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) { dst[idx] = (floatX)((float)dst[idx] + src[idx]); } // have to += because dbias is a paramater
 }
-
+#if 0
 __global__ void matmul_backward_bias_kernel7(float* dbias, const floatX* dout, int B, int T, int OC, const int block_size) {
     // note: this kernel reads in floatX, but it writes to float!
     // this is because we're using atomics, which are super slow in < fp32 precision on < H100 GPUs
@@ -266,7 +270,8 @@ __global__ void matmul_backward_bias_kernel7(float* dbias, const floatX* dout, i
         atomicAdd(dbias + i + blockIdx.x*OC_per_warp, shared[i]);
     }
 }
-
+#endif
+#if 0
 // We want to decrease the amount of channels handled by each block, so that we need fewer across-block reductions.
 // We do this by realizing the following: For scalar memory access, we need to read one element per thread in a warp
 // to read an entire cacheline, but for vectorized memory access, with 128 bit of data per thread, we only need eight
@@ -340,7 +345,8 @@ __global__ void matmul_backward_bias_kernel8(OutFloat* dbias, const floatX* dout
         }
     }
 }
-
+#endif
+#if 0
 // Like kernel 8, but instead of accumulating to the auxiliary buffer, it writes
 // multiple values that need to be summed up in a separate kernel call.
 // If UseAuxBuffer is false, gridDim.y has to be one, and results are added directly
@@ -412,7 +418,7 @@ __global__ void matmul_backward_bias_kernel9(OutFloat* dbias, const floatX* dout
         }
     }
 }
-
+#endif
 
 __global__ void reduce_add_sum_kernel(floatX* dst, const float* src, size_t n, size_t m) {
     const size_t idx = (blockIdx.x * blockDim.x + threadIdx.x) * f128::size;
@@ -450,7 +456,7 @@ void matmul_backward_bias1(floatX* dbias, const floatX* dout,
     matmul_backward_bias_kernel1<<<grid_dim, block_dim, shared_mem_size>>>(dbias, dout, B, T, OC);
     cudaCheck(cudaGetLastError());
 }
-
+#if 0
 void matmul_backward_bias2(floatX* dbias, const floatX* dout,
                       int B, int T, int OC, int block_size) {
     // block_size 512 seems best
@@ -458,6 +464,7 @@ void matmul_backward_bias2(floatX* dbias, const floatX* dout,
     matmul_backward_bias_kernel2<<<grid_size, block_size>>>(dbias, dout, B, T, OC);
     cudaCheck(cudaGetLastError());
 }
+#endif
 
 void matmul_backward_bias3(floatX* dbias, const floatX* dout,
                       int B, int T, int OC, int block_size) {

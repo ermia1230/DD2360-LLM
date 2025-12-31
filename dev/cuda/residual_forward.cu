@@ -37,6 +37,7 @@ __global__ void residual_forward_kernel1(floatX* out, const floatX* inp1, const 
     }
 }
 
+#if 0
 __global__ void residual_forward_kernel2(floatX* out, const floatX* inp1, const floatX* inp2, int N) {
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
     if (idx < N) {
@@ -50,7 +51,7 @@ __global__ void residual_forward_kernel2(floatX* out, const floatX* inp1, const 
         store128(out + idx, packed_out);
     }
 }
-
+#endif
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -60,11 +61,13 @@ void residual_forward1(floatX* out, const floatX* inp1, const floatX* inp2, int 
     cudaCheck(cudaGetLastError());
 }
 
+#if 0
 void residual_forward2(floatX* out, const floatX* inp1, const floatX* inp2, int N, const int block_size) {
     const int grid_size = ceil_div(N, (int)(block_size * x128::size));
     residual_forward_kernel2<<<grid_size, block_size>>>(out, inp1, inp2, N);
     cudaCheck(cudaGetLastError());
 }
+#endif
 
 // kernel version dispatch
 void residual_forward(int kernel_num,
