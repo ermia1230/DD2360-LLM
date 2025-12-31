@@ -796,8 +796,8 @@ void matmul_forward5(float* out,
 
     dim3 blockDim(TILE_N, TILE_M);
     dim3 gridDim(
-        ceil_div(BT, TILE_M),
-        ceil_div(OC, TILE_N)
+        CEIL_DIV(BT, TILE_M),
+        CEIL_DIV(OC, TILE_N)
     );
 
     matmul_forward_kernel5<<<gridDim, blockDim>>>(
@@ -815,8 +815,8 @@ void matmul_forward6(float* out,
 
     dim3 blockDim(TILE_N, TILE_M);
     dim3 gridDim(
-        ceil_div(BT, TILE_M),
-        ceil_div(OC, TILE_N)
+        CEIL_DIV(BT, TILE_M),
+        CEIL_DIV(OC, TILE_N)
     );
 
     matmul_forward_kernel7<<<gridDim, blockDim>>>(
@@ -834,8 +834,8 @@ void matmul_forward7(float* out,
 
     dim3 blockDim(TILE_N, TILE_M);
     dim3 gridDim(
-        ceil_div(BT, TILE_M),
-        ceil_div(OC, TILE_N)
+        CEIL_DIV(BT, TILE_M),
+        CEIL_DIV(OC, TILE_N)
     );
 
     matmul_forward_kernel7<<<gridDim, blockDim>>>(
