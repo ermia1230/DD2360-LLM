@@ -799,6 +799,34 @@ __global__ void softmax_autoregressive_backward_kernel_o3(float* dpreatt, const 
     }
 }
 
+// Algorithmic optimization
+__global__ void softmax_autoregressive_backward_kernel_o4(float* dpreatt, const float* datt, const float* att,
+                                                     int B, int T, int NH, int hs, float scale) {
+
+    extern __shared__ float shared_mem[];
+    float* att_shared = shared_mem; // size T
+    float* datt_shared = &shared_mem[T]; // size T
+    float* dot_product_shared = &shared_mem[2*T]; // size T
+
+    // dpreatt, datt, att are all (B, NH, T, T)
+    int t3 = blockIdx.x * blockDim.x + threadIdx.x;
+    int t = blockIdx.y;
+    int h = blockIdx.z % NH;
+    int b = blockIdx.z / NH;
+
+    // Fill shared memory
+    for (int i = threadIdx.x; i <= t; i += blockDim.x) {
+        att_shared[i] = att[b*NH*T*T + h*T*T + t*T + i];
+        datt_shared[i] = datt[b*NH*T*T + h*T*T + t*T + i];
+        dot_product_shared[i] = att_shared[i] * datt_shared[i];
+    }
+    __syncthreads();
+
+    if (b < B && h < NH && t3 < T && t>=t3 && t < T) {
+        dpreatt[b*NH*T*T + h*T*T + t*T + t3] = scale * att_shared[t3] * (datt_shared[t3] - dot_product_shared[t3]);
+    }
+}
+
 
 // ----------------------------------------------------------------------------
 // kernel launchers
@@ -956,6 +984,15 @@ void launch_softmax_o3(float* dpreatt, float* datt, const float* att, int B, int
     softmax_autoregressive_backward_kernel_o3<<<grid_size, block_size, shared_mem_size>>>(dpreatt, datt, att, B, T, NH, hs, scale);
 }
 
+void launch_softmax_o4(float* dpreatt, float* datt, const float* att, int B, int T, int C, int NH, int block_size) {
+    int hs = C / NH; // head size
+    float scale = 1.0f / sqrtf(hs);
+    size_t shared_mem_size = 3 * T * sizeof(float);
+    int num_blocks_x = ceil_div(T, block_size);
+    dim3 grid_size(num_blocks_x, T, B * NH);
+    softmax_autoregressive_backward_kernel_o4<<<grid_size, block_size, shared_mem_size>>>(dpreatt, datt, att, B, T, NH, hs, scale);
+}
+
 // the sequence of transformations in this compound op is:
 // inp (B,T,3C) -> qkvr (B,T,3C) -> preatt (B,NH,T,T) -> att (B,NH,T,T) -> vaccum (B,T,C) -> out (B,T,C)
 template<class SoftmaxKernel>
@@ -1087,6 +1124,10 @@ void attention_backward(int kernel_num,
         case 13:
             attention_backward1(dinp, dqkvr, dpreatt, datt, dvaccum, dout, inp, qkvr, preatt, att, vaccum, B, T, C, NH,
                                 launch_softmax_o3, block_size);
+            break;
+        case 14:
+            attention_backward1(dinp, dqkvr, dpreatt, datt, dvaccum, dout, inp, qkvr, preatt, att, vaccum, B, T, C, NH,
+                                launch_softmax_o4, block_size);
             break;
         default:
             printf("Invalid kernel number\n");

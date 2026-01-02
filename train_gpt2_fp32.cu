@@ -494,6 +494,34 @@ __global__ void softmax_autoregressive_backward_kernel4(float* dpreatt, const fl
     }
 }
 
+// Algorithmic optimization (avoid loop by precomputing dot product and storing in shared memory)
+__global__ void softmax_autoregressive_backward_kernel5(float* dpreatt, const float* datt, const float* att,
+                                                     int B, int T, int NH, int hs, float scale) {
+
+    extern __shared__ float shared_mem[];
+    float* att_shared = shared_mem; // size T
+    float* datt_shared = &shared_mem[T]; // size T
+    float* dot_product_shared = &shared_mem[2*T]; // size T
+
+    // dpreatt, datt, att are all (B, NH, T, T)
+    int t3 = blockIdx.x * blockDim.x + threadIdx.x;
+    int t = blockIdx.y;
+    int h = blockIdx.z % NH;
+    int b = blockIdx.z / NH;
+
+    // Fill shared memory
+    for (int i = threadIdx.x; i <= t; i += blockDim.x) {
+        att_shared[i] = att[b*NH*T*T + h*T*T + t*T + i];
+        datt_shared[i] = datt[b*NH*T*T + h*T*T + t*T + i];
+        dot_product_shared[i] = att_shared[i] * datt_shared[i];
+    }
+    __syncthreads();
+
+    if (b < B && h < NH && t3 < T && t>=t3 && t < T) {
+        dpreatt[b*NH*T*T + h*T*T + t*T + t3] = scale * att_shared[t3] * (datt_shared[t3] - dot_product_shared[t3]);
+    }
+}
+
 // naive fused kernel
 __global__ void adamw_kernel1(float* params_memory, const float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
                               float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
@@ -1058,6 +1086,15 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
         const dim3 softmax_grid_size(CEIL_DIV(T, softmax_block_size), T, NH * B);
         size_t shared_mem_size = 2 * T * sizeof(float);
         softmax_autoregressive_backward_kernel4<<<softmax_grid_size, softmax_block_size, shared_mem_size>>>(dpreatt, datt, att, B, T, NH, hs, scale);
+        break;
+    }
+    case 5: {
+        const int softmax_block_size = 256;
+        const int hs = C / NH;
+        const float scale = 1.0f / sqrtf(hs);
+        const dim3 softmax_grid_size(CEIL_DIV(T, softmax_block_size), T, NH * B);
+        size_t shared_mem_size = 3 * T * sizeof(float);
+        softmax_autoregressive_backward_kernel5<<<softmax_grid_size, softmax_block_size, shared_mem_size>>>(dpreatt, datt, att, B, T, NH, hs, scale);
         break;
     }
     default: {
