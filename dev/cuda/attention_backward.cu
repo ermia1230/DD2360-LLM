@@ -799,14 +799,14 @@ __global__ void softmax_autoregressive_backward_kernel_o3(float* dpreatt, const 
     }
 }
 
-// Algorithmic optimization
+// Algorithmic optimization (avoid loop by precomputing dot product and storing in shared memory)
 __global__ void softmax_autoregressive_backward_kernel_o4(float* dpreatt, const float* datt, const float* att,
                                                      int B, int T, int NH, int hs, float scale) {
 
     extern __shared__ float shared_mem[];
     float* att_shared = shared_mem; // size T
     float* datt_shared = &shared_mem[T]; // size T
-    float* dot_product_shared = &shared_mem[2*T]; // size T
+    float* partial_dot_product_shared = &shared_mem[2*T]; // size T
 
     // dpreatt, datt, att are all (B, NH, T, T)
     int t3 = blockIdx.x * blockDim.x + threadIdx.x;
@@ -815,15 +815,28 @@ __global__ void softmax_autoregressive_backward_kernel_o4(float* dpreatt, const 
     int b = blockIdx.z / NH;
 
     // Fill shared memory
+    float thread_accum = 0.0f;
     for (int i = threadIdx.x; i <= t; i += blockDim.x) {
         att_shared[i] = att[b*NH*T*T + h*T*T + t*T + i];
         datt_shared[i] = datt[b*NH*T*T + h*T*T + t*T + i];
-        dot_product_shared[i] = att_shared[i] * datt_shared[i];
+        thread_accum += att_shared[i] * datt_shared[i];
     }
+    partial_dot_product_shared[threadIdx.x] = thread_accum;
     __syncthreads();
 
+    // Reduce to get the full dot product
+    int num_active_threads = min(blockDim.x, t + 1);
+    while (num_active_threads > 1) {
+        int offset = (num_active_threads + 1) / 2;
+        if (threadIdx.x < num_active_threads / 2) {
+            partial_dot_product_shared[threadIdx.x] += partial_dot_product_shared[threadIdx.x + offset];
+        }
+        __syncthreads();
+        num_active_threads = offset;
+    }
+
     if (b < B && h < NH && t3 < T && t>=t3 && t < T) {
-        dpreatt[b*NH*T*T + h*T*T + t*T + t3] = scale * att_shared[t3] * (datt_shared[t3] - dot_product_shared[t3]);
+        dpreatt[b*NH*T*T + h*T*T + t*T + t3] = scale * att_shared[t3] * (datt_shared[t3] - partial_dot_product_shared[0]);
     }
 }
 
@@ -987,7 +1000,7 @@ void launch_softmax_o3(float* dpreatt, float* datt, const float* att, int B, int
 void launch_softmax_o4(float* dpreatt, float* datt, const float* att, int B, int T, int C, int NH, int block_size) {
     int hs = C / NH; // head size
     float scale = 1.0f / sqrtf(hs);
-    size_t shared_mem_size = 3 * T * sizeof(float);
+    size_t shared_mem_size = (2 * T + block_size) * sizeof(float);
     int num_blocks_x = ceil_div(T, block_size);
     dim3 grid_size(num_blocks_x, T, B * NH);
     softmax_autoregressive_backward_kernel_o4<<<grid_size, block_size, shared_mem_size>>>(dpreatt, datt, att, B, T, NH, hs, scale);
