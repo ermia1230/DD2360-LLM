@@ -2,7 +2,7 @@
 Kernels for attention backward pass.
 
 Compile example:
-nvcc -O3 --use_fast_math -lcublas -lcublasLt attention_backward.cu -o attention_backward
+nvcc -O3 --use_fast_math -Xcompiler -fopenmp -arch=sm_75 attention_backward.cu -o attention_backward -lcublas -lcublasLt
 
 version 1 is a naive first version
 OMP_NUM_THREADS=32 ./attention_backward 1
@@ -781,7 +781,7 @@ __global__ void softmax_autoregressive_backward_kernel_o3(float* dpreatt, const 
     int b = blockIdx.z / NH;
 
     // Fill shared memory
-    for (int i = threadIdx.x; i < T; i += blockDim.x) {
+    for (int i = threadIdx.x; i <= t; i += blockDim.x) {
         att_shared[i] = att[b*NH*T*T + h*T*T + t*T + i];
         datt_shared[i] = datt[b*NH*T*T + h*T*T + t*T + i];
     }

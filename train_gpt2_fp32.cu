@@ -476,7 +476,7 @@ __global__ void softmax_autoregressive_backward_kernel4(float* dpreatt, const fl
     int b = blockIdx.z / NH;
 
     // Fill shared memory
-    for (int i = threadIdx.x; i < T; i += blockDim.x) {
+    for (int i = threadIdx.x; i <= t; i += blockDim.x) {
         att_shared[i] = att[b*NH*T*T + h*T*T + t*T + i];
         datt_shared[i] = datt[b*NH*T*T + h*T*T + t*T + i];
     }
