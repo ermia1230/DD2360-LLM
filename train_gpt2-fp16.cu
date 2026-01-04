@@ -26,6 +26,23 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 #include <cuda_fp16.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+
+
+__device__ __forceinline__ void atomicAddHalf(__half* address, __half val) {
+    unsigned int* address_as_uint = (unsigned int*)((size_t)address & ~2);
+    unsigned int old = *address_as_uint;
+    unsigned int assumed;
+    
+    do {
+        assumed = old;
+        __half2 temp = *reinterpret_cast<__half2*>(&old);
+        unsigned short index = (size_t)address & 2 ? 1 : 0;
+        __half* ptr = reinterpret_cast<__half*>(&temp) + index;
+        *ptr = __hadd(*ptr, val);
+        old = atomicCAS(address_as_uint, assumed, *reinterpret_cast<unsigned int*>(&temp));
+    } while (assumed != old);
+}
+
 // our own utilities
 // defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
 #include "llmc/utils.h"
@@ -35,7 +52,7 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 #include "llmc/dataloader.h"
 
 // Define kernels to use
-#define SOFTMAX_FORWARD_KERNEL 1  // 1=baseline, 2=o1(warp), 3=o2(online), 4=o3(vectorized), 5=o4(combined)
+#define SOFTMAX_FORWARD_KERNEL 5  // 1=baseline, 2=o1(warp), 3=o2(online), 4=o3(vectorized), 5=o4(combined)
 #define SOFTMAX_BACKWARD_KERNEL 5
 
 
@@ -112,8 +129,8 @@ __global__ void encoder_backward_kernel1(__half* dwte, __half* dwpe,
         __half* dwte_ix = dwte + ix * C + c;
         __half* dwpe_tc = dwpe + t * C + c;
 
-        atomicAdd(dwte_ix, *dout_btc);
-        atomicAdd(dwpe_tc, *dout_btc);
+        atomicAddHalf(dwte_ix, *dout_btc);
+        atomicAddHalf(dwpe_tc, *dout_btc);
     }
 }
 
@@ -695,9 +712,9 @@ __global__ void layernorm_backward_kernel1(__half* dinp, __half* dweight, __half
         float norm_bti = (__half2float(inp_bt[i]) - mean_bt) * rstd_bt;
         float dnorm_i = __half2float(weight[i]) * __half2float(dout_bt[i]);
         // gradient contribution to bias
-        atomicAdd(&dbias[i], dout_bt[i]);
+        atomicAddHalf(&dbias[i], dout_bt[i]);
         // gradient contribution to weight
-        atomicAdd(&dweight[i], __float2half(norm_bti * __half2float(dout_bt[i])));
+        atomicAddHalf(&dweight[i], __float2half(norm_bti * __half2float(dout_bt[i])));
         // gradient contribution to input
         float dval = 0.0f;
         dval += dnorm_i; // term 1
@@ -1291,11 +1308,20 @@ void attention_forward(__half* out, __half* qkvr, __half* att,
     permute_kernel1<<<num_blocks, block_size>>>(q, k, v, inp, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
 
-    // batched matrix multiply with cuBLAS
-    const __half alpha = __float2half(1.0f);
-    const __half beta = __float2half(0.0f);
+    // batched matrix multiply with cuBLAS (using GemmEx for tensor core acceleration)
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
     __half* preatt = inp;
-    cublasCheck(cublasHgemmStridedBatched(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, T, T, HS, &alpha, k, HS, T * HS, q, HS, T * HS, &beta, preatt, T, T * T, B * NH));
+    cublasCheck(cublasGemmStridedBatchedEx(cublas_handle, 
+        CUBLAS_OP_T, CUBLAS_OP_N, 
+        T, T, HS, 
+        &alpha, 
+        k, CUDA_R_16F, HS, T * HS, 
+        q, CUDA_R_16F, HS, T * HS, 
+        &beta, 
+        preatt, CUDA_R_16F, T, T * T, 
+        B * NH, 
+        cublas_compute_type, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 
     // multiply all elements of preatt elementwise by scale and apply autoregressive mask
     float scale = 1.0 / sqrtf(HS);
@@ -1334,7 +1360,16 @@ void attention_forward(__half* out, __half* qkvr, __half* att,
     // new approach: first cuBLAS another batched matmul
     __half* vaccum = inp;
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
-    cublasCheck(cublasHgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, HS, T, T, &alpha, v, HS, T * HS, att, T, T * T, &beta, vaccum, HS, T * HS, B * NH));
+    cublasCheck(cublasGemmStridedBatchedEx(cublas_handle, 
+        CUBLAS_OP_N, CUBLAS_OP_N, 
+        HS, T, T, 
+        &alpha, 
+        v, CUDA_R_16F, HS, T * HS, 
+        att, CUDA_R_16F, T, T * T, 
+        &beta, 
+        vaccum, CUDA_R_16F, HS, T * HS, 
+        B * NH, 
+        cublas_compute_type, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 
     // now unpermute
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
@@ -1367,12 +1402,28 @@ void gelu_backward(__half* dinp, const __half* inp, const __half* dout, const in
 void matmul_backward(__half* dinp, __half* dweight, __half* dbias,
                      __half* dout, __half* inp, __half* weight,
                      int B, int T, int C, int OC) {
-    __half one = __float2half(1.0f);
-    __half zero = __float2half(0.0f);
+    float one = 1.0f;
+    float zero = 0.0f;
     // backward to input, uses = in the backward pass (set the gradient)
-    cublasCheck(cublasHgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, C, B*T, OC, &one, weight, C, dout, OC, &zero, dinp, C));
+    cublasCheck(cublasGemmEx(cublas_handle, 
+        CUBLAS_OP_N, CUBLAS_OP_N, 
+        C, B*T, OC, 
+        &one, 
+        weight, CUDA_R_16F, C, 
+        dout, CUDA_R_16F, OC, 
+        &zero, 
+        dinp, CUDA_R_16F, C, 
+        cublas_compute_type, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     // backward to weight, uses += in the backward pass (accumulate the gradient)
-    cublasCheck(cublasHgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, C, OC, B*T, &one, inp, C, dout, OC, &one, dweight, C));
+    cublasCheck(cublasGemmEx(cublas_handle, 
+        CUBLAS_OP_N, CUBLAS_OP_T, 
+        C, OC, B*T, 
+        &one, 
+        inp, CUDA_R_16F, C, 
+        dout, CUDA_R_16F, OC, 
+        &one, 
+        dweight, CUDA_R_16F, C, 
+        cublas_compute_type, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     // backward to bias, if given, does a +=
     if (dbias != NULL) {
         const int block_size = 512;
@@ -1416,9 +1467,29 @@ void attention_backward(__half* dinp, __half* dqkvr, __half* dpreatt, __half* da
     unpermute_kernel_backward<<<num_blocks, block_size>>>(scratch, dout, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
     // backward into datt
-    cublasCheck(cublasHgemmStridedBatched(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, T, T, HS, &one, v, HS, T * HS, scratch, HS, T * HS, &zero, datt, T, T * T, B * NH));
+    float one = 1.0f;
+    float zero = 0.0f;
+    cublasCheck(cublasGemmStridedBatchedEx(cublas_handle, 
+        CUBLAS_OP_T, CUBLAS_OP_N, 
+        T, T, HS, 
+        &one, 
+        v, CUDA_R_16F, HS, T * HS, 
+        scratch, CUDA_R_16F, HS, T * HS, 
+        &zero, 
+        datt, CUDA_R_16F, T, T * T, 
+        B * NH, 
+        cublas_compute_type, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     // backward into dv
-    cublasCheck(cublasHgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, HS, T, T, &one, scratch, HS, T * HS, att, T, T * T, &zero, dv, HS, T * HS, B * NH));
+    cublasCheck(cublasGemmStridedBatchedEx(cublas_handle, 
+        CUBLAS_OP_N, CUBLAS_OP_T, 
+        HS, T, T, 
+        &one, 
+        scratch, CUDA_R_16F, HS, T * HS, 
+        att, CUDA_R_16F, T, T * T, 
+        &zero, 
+        dv, CUDA_R_16F, HS, T * HS, 
+        B * NH, 
+        cublas_compute_type, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     // backward into preatt
     switch (SOFTMAX_BACKWARD_KERNEL)
     {
@@ -1467,9 +1538,27 @@ void attention_backward(__half* dinp, __half* dqkvr, __half* dpreatt, __half* da
     }
     cudaCheck(cudaGetLastError());
     // backward into q
-    cublasCheck(cublasHgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, HS, T, T, &one, k, HS, T * HS, dpreatt, T, T * T, &zero, dq, HS, T * HS, B * NH));
+    cublasCheck(cublasGemmStridedBatchedEx(cublas_handle, 
+        CUBLAS_OP_N, CUBLAS_OP_N, 
+        HS, T, T, 
+        &one, 
+        k, CUDA_R_16F, HS, T * HS, 
+        dpreatt, CUDA_R_16F, T, T * T, 
+        &zero, 
+        dq, CUDA_R_16F, HS, T * HS, 
+        B * NH, 
+        cublas_compute_type, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     // backward into k
-    cublasCheck(cublasHgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, HS, T, T, &one, q, HS, T * HS, dpreatt, T, T * T, &zero, dk, HS, T * HS, B * NH));
+    cublasCheck(cublasGemmStridedBatchedEx(cublas_handle, 
+        CUBLAS_OP_N, CUBLAS_OP_T, 
+        HS, T, T, 
+        &one, 
+        q, CUDA_R_16F, HS, T * HS, 
+        dpreatt, CUDA_R_16F, T, T * T, 
+        &zero, 
+        dk, CUDA_R_16F, HS, T * HS, 
+        B * NH, 
+        cublas_compute_type, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     // backward into inp
     num_blocks = CEIL_DIV(B * NH * T * HS, block_size);
     permute_kernel_backward<<<num_blocks, block_size>>>(dinp, dq, dk, dv, B, T, NH, HS);
@@ -2051,6 +2140,17 @@ void gpt2_backward(GPT2 *model) {
     encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs, B, T, C);
 }
 
+// Gradient clipping kernel - important for FP16 stability
+__global__ void gradient_clip_kernel(__half* grads, long num_parameters, float clip_value) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_parameters) return;
+    
+    float grad = __half2float(grads[i]);
+    // Clip gradient to prevent overflow in FP16
+    grad = fmaxf(-clip_value, fminf(clip_value, grad));
+    grads[i] = __float2half(grad);
+}
+
 void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, int t) {
     // reference: https://pytorch.org/docs/stable/generated/torch.optim.AdamW.html
 
@@ -2066,6 +2166,11 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
 
     int block_size = 512;
     int num_blocks = CEIL_DIV(model->num_parameters, block_size);
+    
+    // Clip gradients to prevent overflow/underflow in FP16 (clip to ±10.0)
+    gradient_clip_kernel<<<num_blocks, block_size>>>(model->grads_memory, model->num_parameters, 10.0f);
+    cudaCheck(cudaGetLastError());
+    
     float beta1_correction = 1.0f - powf(beta1, t);
     float beta2_correction = 1.0f - powf(beta2, t);
     adamw_kernel1<<<num_blocks, block_size>>>(model->params_memory, model->grads_memory, model->m_memory, model->v_memory,
@@ -2227,14 +2332,21 @@ int main(int argc, char *argv[]) {
     cudaGetDeviceProperties(&deviceProp, deviceIdx);
     // setup cuBLAS and cuBLASLt
     cublasCheck(cublasCreate(&cublas_handle));
-    // For FP16 operations, we use FP32 compute type for better numerical stability
-    // This gives us FP16 storage with FP32 accumulation
+    // For FP16 operations with tensor cores: use CUBLAS_COMPUTE_32F_FAST_16F
+    // This enables FP16 tensor cores with FP32 accumulation for maximum performance
     int enable_tf32 = deviceProp.major >= 8 ? 1 : 0;
-    cublas_compute_type = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
-    cublasMath_t cublas_math_mode = enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
-    cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
-    printf("| device                | %-50s |\n", deviceProp.name);
-    printf("| TF32                  | %-50s |\n", enable_tf32 ? "enabled" : "disabled");
+    // For FP16, we want tensor core acceleration (available on compute capability >= 7.0)
+    if (deviceProp.major >= 7) {
+        cublas_compute_type = CUBLAS_COMPUTE_32F_FAST_16F;  // Enables FP16 tensor cores
+        cublasCheck(cublasSetMathMode(cublas_handle, CUBLAS_TENSOR_OP_MATH));
+        printf("| device                | %-50s |\n", deviceProp.name);
+        printf("| tensor cores          | %-50s |\n", "enabled (FP16)");
+    } else {
+        cublas_compute_type = CUBLAS_COMPUTE_32F;
+        cublasCheck(cublasSetMathMode(cublas_handle, CUBLAS_DEFAULT_MATH));
+        printf("| device                | %-50s |\n", deviceProp.name);
+        printf("| tensor cores          | %-50s |\n", "not available");
+    }
     printf("| precision             | %-50s |\n", "FP16 (with FP32 accumulation)");
     printf("+-----------------------+----------------------------------------------------+\n");
 
