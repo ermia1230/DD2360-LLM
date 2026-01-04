@@ -1257,7 +1257,7 @@ void matmul_forward1(float* out,
                      const int sqrt_block_size) {
     // out is (B,T,OC). OC is short for "output channels", e.g. OC = 4 * C
     // inp is (B,T,C), weight is (OC, C), bias is (OC)
-    dim3 gridDim(ceil_div(B * T, sqrt_block_size), ceil_div(OC, sqrt_block_size));
+    dim3 gridDim(CEIL_DIV(B * T, sqrt_block_size), CEIL_DIV(OC, sqrt_block_size));
     dim3 blockDim(sqrt_block_size, sqrt_block_size);
     matmul_forward_kernel1<<<gridDim, blockDim>>>(out, inp, weight, bias, B*T, C, OC);
     cudaCheck(cudaGetLastError());
@@ -1272,8 +1272,8 @@ void matmul_forward2(float* out,
 
     dim3 blockDim(TILE_N, TILE_M);
     dim3 gridDim(
-        ceil_div(BT, TILE_M),
-        ceil_div(OC, TILE_N)
+        CEIL_DIV(BT, TILE_M),
+        CEIL_DIV(OC, TILE_N)
     );
 
     matmul_forward_kernel2<<<gridDim, blockDim>>>(
@@ -1291,8 +1291,8 @@ void matmul_forward3(float* out,
 
     dim3 blockDim(TILE_N, TILE_M);
     dim3 gridDim(
-        ceil_div(BT, TILE_M),
-        ceil_div(OC, TILE_N)
+        CEIL_DIV(BT, TILE_M),
+        CEIL_DIV(OC, TILE_N)
     );
 
     matmul_forward_kernel3<<<gridDim, blockDim>>>(
@@ -1310,8 +1310,8 @@ void matmul_forward4(float* out,
 
     dim3 blockDim(TILE_N, TILE_M);
     dim3 gridDim(
-        ceil_div(BT, TILE_M),
-        ceil_div(OC, TILE_N)
+        CEIL_DIV(BT, TILE_M),
+        CEIL_DIV(OC, TILE_N)
     );
 
     matmul_forward_kernel4<<<gridDim, blockDim>>>(
