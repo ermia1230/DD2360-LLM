@@ -34,6 +34,7 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 #include "llmc/dataloader.h"
 
 // Define kernels to use
+#define SOFTMAX_FORWARD_KERNEL 1  // 1=baseline, 2=o1(warp), 3=o2(online), 4=o3(vectorized), 5=o4(combined)
 #define SOFTMAX_BACKWARD_KERNEL 5
 
 
@@ -279,6 +280,314 @@ __global__ void softmax_forward_kernel1(float* out, const float* inp, int N, int
     float norm = 1.0f / (float)sum;
     for (int col = 0; col < T; col++) {
         out_row[col] *= norm;
+    }
+}
+
+// Optimization 1: Add shared memory to cache row data
+// Fixes: Poor memory access - Now loads row into shared memory once
+__global__ void softmax_forward_kernel_o1(float* out, const float* inp, int N, int T) {
+    extern __shared__ float shared_row[];
+    
+    // Each block processes one row
+    int row = blockIdx.x;
+    if (row >= N * T) {
+        return;
+    }
+    
+    int tid = threadIdx.x;
+    int block_size = blockDim.x;
+    
+    const float* inp_row = inp + row * T;
+    float* out_row = out + row * T;
+    
+    // Cooperatively load row into shared memory (coalesced access)
+    for (int i = tid; i < T; i += block_size) {
+        shared_row[i] = inp_row[i];
+    }
+    __syncthreads();
+    
+    // Thread 0 does the computation (still sequential, but from shared memory)
+    if (tid == 0) {
+        // Find max
+        float maxval = -INFINITY;
+        for (int col = 0; col < T; col++) {
+            if (shared_row[col] > maxval) {
+                maxval = shared_row[col];
+            }
+        }
+        
+        // Compute exp and sum
+        float sum = 0.0f;
+        for (int col = 0; col < T; col++) {
+            float exp_val = expf(shared_row[col] - maxval);
+            shared_row[col] = exp_val;  // Store back to shared memory
+            sum += exp_val;
+        }
+        
+        // Normalize
+        float norm = 1.0f / sum;
+        for (int col = 0; col < T; col++) {
+            shared_row[col] *= norm;
+        }
+    }
+    __syncthreads();
+    
+    // Cooperatively write result back to global memory
+    for (int i = tid; i < T; i += block_size) {
+        out_row[i] = shared_row[i];
+    }
+}
+
+// Optimization 2: Add parallel reduction for max and sum
+// Fixes: No parallelism within each row - Now multiple threads work together
+__global__ void softmax_forward_kernel_o2(float* out, const float* inp, int N, int T) {
+    extern __shared__ float shared[];
+    
+    int row = blockIdx.x;
+    if (row >= N * T) {
+        return;
+    }
+    
+    int tid = threadIdx.x;
+    int block_size = blockDim.x;
+    
+    const float* inp_row = inp + row * T;
+    float* out_row = out + row * T;
+    
+    // Step 1: Parallel reduction to find max
+    float thread_max = -INFINITY;
+    for (int i = tid; i < T; i += block_size) {
+        thread_max = fmaxf(thread_max, inp_row[i]);
+    }
+    shared[tid] = thread_max;
+    __syncthreads();
+    
+    // Reduce max in shared memory
+    for (int stride = block_size / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            shared[tid] = fmaxf(shared[tid], shared[tid + stride]);
+        }
+        __syncthreads();
+    }
+    float maxval = shared[0];
+    __syncthreads();
+    
+    // Step 2: Parallel computation of exp and sum
+    float thread_sum = 0.0f;
+    for (int i = tid; i < T; i += block_size) {
+        float exp_val = expf(inp_row[i] - maxval);
+        out_row[i] = exp_val;
+        thread_sum += exp_val;
+    }
+    shared[tid] = thread_sum;
+    __syncthreads();
+    
+    // Reduce sum in shared memory
+    for (int stride = block_size / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            shared[tid] += shared[tid + stride];
+        }
+        __syncthreads();
+    }
+    float sum = shared[0];
+    __syncthreads();
+    
+    // Step 3: Parallel normalization
+    float norm = 1.0f / sum;
+    for (int i = tid; i < T; i += block_size) {
+        out_row[i] *= norm;
+    }
+}
+
+// Optimization 3: Use warp-level primitives for efficient reductions
+// Fixes: No warp-level primitives - Now uses __shfl_down_sync for faster reductions
+__device__ float warpReduceMax(float val) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val = fmaxf(val, __shfl_down_sync(0xFFFFFFFF, val, offset));
+    }
+    return val;
+}
+
+__device__ float warpReduceSum(float val) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+    }
+    return val;
+}
+
+__global__ void softmax_forward_kernel_o3(float* out, const float* inp, int N, int T) {
+    extern __shared__ float shared[];
+    
+    int row = blockIdx.x;
+    if (row >= N * T) {
+        return;
+    }
+    
+    int tid = threadIdx.x;
+    int warpId = tid / 32;
+    int laneId = tid % 32;
+    int block_size = blockDim.x;
+    int warpsPerBlock = block_size / 32;
+    
+    const float* inp_row = inp + row * T;
+    float* out_row = out + row * T;
+    
+    // Step 1: Find max with warp primitives
+    float thread_max = -INFINITY;
+    for (int i = tid; i < T; i += block_size) {
+        thread_max = fmaxf(thread_max, inp_row[i]);
+    }
+    
+    // Warp-level reduction
+    float warp_max = warpReduceMax(thread_max);
+    
+    // First thread in each warp writes to shared memory
+    if (laneId == 0) {
+        shared[warpId] = warp_max;
+    }
+    __syncthreads();
+    
+    // First warp reduces across warps
+    if (tid < warpsPerBlock) {
+        warp_max = shared[tid];
+    } else {
+        warp_max = -INFINITY;
+    }
+    if (warpId == 0) {
+        warp_max = warpReduceMax(warp_max);
+    }
+    if (tid == 0) {
+        shared[0] = warp_max;
+    }
+    __syncthreads();
+    float maxval = shared[0];
+    
+    // Step 2: Compute exp and sum with warp primitives
+    float thread_sum = 0.0f;
+    for (int i = tid; i < T; i += block_size) {
+        float exp_val = expf(inp_row[i] - maxval);
+        out_row[i] = exp_val;
+        thread_sum += exp_val;
+    }
+    
+    // Warp-level reduction for sum
+    float warp_sum = warpReduceSum(thread_sum);
+    
+    if (laneId == 0) {
+        shared[warpId] = warp_sum;
+    }
+    __syncthreads();
+    
+    // First warp reduces across warps
+    if (tid < warpsPerBlock) {
+        warp_sum = shared[tid];
+    } else {
+        warp_sum = 0.0f;
+    }
+    if (warpId == 0) {
+        warp_sum = warpReduceSum(warp_sum);
+    }
+    if (tid == 0) {
+        shared[0] = warp_sum;
+    }
+    __syncthreads();
+    float sum = shared[0];
+    
+    // Step 3: Normalize
+    float norm = 1.0f / sum;
+    for (int i = tid; i < T; i += block_size) {
+        out_row[i] *= norm;
+    }
+}
+
+// Optimization 4: Improved memory coalescing with float4 loads
+// Fixes: Memory coalescing - Uses vectorized loads for better bandwidth
+__global__ void softmax_forward_kernel_o4(float* out, const float* inp, int N, int T) {
+    extern __shared__ float shared[];
+    
+    int row = blockIdx.x;
+    if (row >= N * T) {
+        return;
+    }
+    
+    int tid = threadIdx.x;
+    int warpId = tid / 32;
+    int laneId = tid % 32;
+    int block_size = blockDim.x;
+    int warpsPerBlock = block_size / 32;
+    
+    const float* inp_row = inp + row * T;
+    float* out_row = out + row * T;
+    
+    int T_vec = T / 4;  // Number of float4 elements
+    
+    // Step 1: Find max with vectorized loads
+    float thread_max = -INFINITY;
+    for (int i = tid; i < T_vec; i += block_size) {
+        float4 vals = *reinterpret_cast<const float4*>(&inp_row[i * 4]);
+        thread_max = fmaxf(thread_max, fmaxf(fmaxf(vals.x, vals.y), fmaxf(vals.z, vals.w)));
+    }
+    // Handle remainder
+    for (int i = T_vec * 4 + tid; i < T; i += block_size) {
+        thread_max = fmaxf(thread_max, inp_row[i]);
+    }
+    
+    // Warp reduction
+    float warp_max = warpReduceMax(thread_max);
+    if (laneId == 0) shared[warpId] = warp_max;
+    __syncthreads();
+    
+    if (tid < warpsPerBlock) warp_max = shared[tid];
+    else warp_max = -INFINITY;
+    if (warpId == 0) warp_max = warpReduceMax(warp_max);
+    if (tid == 0) shared[0] = warp_max;
+    __syncthreads();
+    float maxval = shared[0];
+    
+    // Step 2: Compute exp and sum with vectorized operations
+    float thread_sum = 0.0f;
+    for (int i = tid; i < T_vec; i += block_size) {
+        float4 vals = *reinterpret_cast<const float4*>(&inp_row[i * 4]);
+        float4 exp_vals;
+        exp_vals.x = expf(vals.x - maxval);
+        exp_vals.y = expf(vals.y - maxval);
+        exp_vals.z = expf(vals.z - maxval);
+        exp_vals.w = expf(vals.w - maxval);
+        *reinterpret_cast<float4*>(&out_row[i * 4]) = exp_vals;
+        thread_sum += exp_vals.x + exp_vals.y + exp_vals.z + exp_vals.w;
+    }
+    // Handle remainder
+    for (int i = T_vec * 4 + tid; i < T; i += block_size) {
+        float exp_val = expf(inp_row[i] - maxval);
+        out_row[i] = exp_val;
+        thread_sum += exp_val;
+    }
+    
+    // Warp reduction for sum
+    float warp_sum = warpReduceSum(thread_sum);
+    if (laneId == 0) shared[warpId] = warp_sum;
+    __syncthreads();
+    
+    if (tid < warpsPerBlock) warp_sum = shared[tid];
+    else warp_sum = 0.0f;
+    if (warpId == 0) warp_sum = warpReduceSum(warp_sum);
+    if (tid == 0) shared[0] = warp_sum;
+    __syncthreads();
+    float sum = shared[0];
+    
+    // Step 3: Normalize with vectorized stores
+    float norm = 1.0f / sum;
+    for (int i = tid; i < T_vec; i += block_size) {
+        float4 vals = *reinterpret_cast<const float4*>(&out_row[i * 4]);
+        vals.x *= norm;
+        vals.y *= norm;
+        vals.z *= norm;
+        vals.w *= norm;
+        *reinterpret_cast<float4*>(&out_row[i * 4]) = vals;
+    }
+    // Handle remainder
+    for (int i = T_vec * 4 + tid; i < T; i += block_size) {
+        out_row[i] *= norm;
     }
 }
 
@@ -976,9 +1285,32 @@ void attention_forward(float* out, float* qkvr, float* att,
     scale_kernel<<<scale_grid_size, block_size>>>(preatt, scale, B, NH, T);
     cudaCheck(cudaGetLastError());
     
-    // apply softmax
+    // apply softmax with selected kernel
+#if SOFTMAX_FORWARD_KERNEL == 1
+    // Baseline: one thread per row, sequential processing
     int grid_size = CEIL_DIV(B * NH * T, softmax_block_size);
     softmax_forward_kernel1<<<grid_size, softmax_block_size>>>(att, preatt, B * NH, T);
+#elif SOFTMAX_FORWARD_KERNEL == 2
+    // O1: shared memory caching
+    int grid_size = B * NH * T;  // One block per row
+    size_t shared_mem = T * sizeof(float);
+    softmax_forward_kernel_o1<<<grid_size, softmax_block_size, shared_mem>>>(att, preatt, B * NH, T);
+#elif SOFTMAX_FORWARD_KERNEL == 3
+    // O2: parallel reduction with shared memory
+    int grid_size = B * NH * T;  // One block per row
+    size_t shared_mem = softmax_block_size * sizeof(float);
+    softmax_forward_kernel_o2<<<grid_size, softmax_block_size, shared_mem>>>(att, preatt, B * NH, T);
+#elif SOFTMAX_FORWARD_KERNEL == 4
+    // O3: warp-level primitives
+    int grid_size = B * NH * T;  // One block per row
+    size_t shared_mem = (softmax_block_size / 32) * sizeof(float);
+    softmax_forward_kernel_o3<<<grid_size, softmax_block_size, shared_mem>>>(att, preatt, B * NH, T);
+#elif SOFTMAX_FORWARD_KERNEL == 5
+    // O4: vectorized memory access
+    int grid_size = B * NH * T;  // One block per row
+    size_t shared_mem = (softmax_block_size / 32) * sizeof(float);
+    softmax_forward_kernel_o4<<<grid_size, softmax_block_size, shared_mem>>>(att, preatt, B * NH, T);
+#endif
     cudaCheck(cudaGetLastError());
 
     // new approach: first cuBLAS another batched matmul

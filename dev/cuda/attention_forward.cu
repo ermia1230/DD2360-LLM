@@ -35,12 +35,22 @@ version 5 is a FP16 version of kernel 4
 ./attention_forward 5
 
 version 6 is kernel 5 skipping (un)permute (unrealistic but useful comparison point)
+./attention_forward 6
 
-version 10 is using cuDNN Flash Attention using FP16 or BF16, see:
-https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/Attention.md
+version 7 is educational optimization 1: shared memory caching for attention softmax
+./attention_forward 7
+
+version 8 is educational optimization 2: parallel reduction for attention softmax
+./attention_forward 8
+
+version 9 is educational optimization 3: warp primitives for attention softmax
+./attention_forward 9
+
+version 10 is educational optimization 4: vectorized memory access for attention softmax
 ./attention_forward 10
 
-version 11 is kernel 10 skipping FP16/FP32 conversions (full FP16/BF16 network)
+version 11 is using cuDNN Flash Attention using FP16 or BF16, see:
+https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/Attention.md
 ./attention_forward 11
 */
 //#define ENABLE_CUDNN // can be enabled via nvcc "-DENABLE_CUDNN"
@@ -231,6 +241,319 @@ __global__ void attention_softmax_kernel1(float* att, const float* preatt,
         }
     }
 }
+
+// ----------------------------------------------------------------------------
+// Educational progressive optimizations for attention softmax
+// These kernels demonstrate fundamental GPU optimization techniques step-by-step
+// Each optimization addresses a specific performance issue
+
+// Optimization 1: Add shared memory to cache row data
+// Fixes: Poor memory access - Now loads row into shared memory once
+// This kernel shows how shared memory can reduce global memory accesses
+__global__ void attention_softmax_opt1_shared(float* out, const float* inp, int N, int T) {
+    extern __shared__ float shared_row[];
+    
+    // Each block processes one row
+    int row = blockIdx.x;
+    if (row >= N * T) return;
+    
+    int tid = threadIdx.x;
+    int block_size = blockDim.x;
+    
+    const float* inp_row = inp + row * T;
+    float* out_row = out + row * T;
+    
+    // Cooperatively load row into shared memory (coalesced access)
+    for (int i = tid; i < T; i += block_size) {
+        shared_row[i] = inp_row[i];
+    }
+    __syncthreads();
+    
+    // Thread 0 does the computation (still sequential, but from faster shared memory)
+    if (tid == 0) {
+        // Find max
+        float maxval = -INFINITY;
+        for (int col = 0; col < T; col++) {
+            if (shared_row[col] > maxval) {
+                maxval = shared_row[col];
+            }
+        }
+        
+        // Compute exp and sum
+        float sum = 0.0f;
+        for (int col = 0; col < T; col++) {
+            float exp_val = expf(shared_row[col] - maxval);
+            shared_row[col] = exp_val;
+            sum += exp_val;
+        }
+        
+        // Normalize
+        float norm = 1.0f / sum;
+        for (int col = 0; col < T; col++) {
+            shared_row[col] *= norm;
+        }
+    }
+    __syncthreads();
+    
+    // Cooperatively write result back to global memory
+    for (int i = tid; i < T; i += block_size) {
+        out_row[i] = shared_row[i];
+    }
+}
+
+// Optimization 2: Add parallel reduction for max and sum
+// Fixes: No parallelism within each row - Now multiple threads work together
+// This kernel demonstrates tree-based parallel reduction
+__global__ void attention_softmax_opt2_parallel(float* out, const float* inp, int N, int T) {
+    extern __shared__ float shared[];
+    
+    int row = blockIdx.x;
+    if (row >= N * T) return;
+    
+    int tid = threadIdx.x;
+    int block_size = blockDim.x;
+    
+    const float* inp_row = inp + row * T;
+    float* out_row = out + row * T;
+    
+    // Step 1: Parallel reduction to find max
+    float thread_max = -INFINITY;
+    for (int i = tid; i < T; i += block_size) {
+        thread_max = fmaxf(thread_max, inp_row[i]);
+    }
+    shared[tid] = thread_max;
+    __syncthreads();
+    
+    // Reduce max in shared memory (classic tree reduction)
+    for (int stride = block_size / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            shared[tid] = fmaxf(shared[tid], shared[tid + stride]);
+        }
+        __syncthreads();
+    }
+    float maxval = shared[0];
+    __syncthreads();
+    
+    // Step 2: Parallel computation of exp and sum
+    float thread_sum = 0.0f;
+    for (int i = tid; i < T; i += block_size) {
+        float exp_val = expf(inp_row[i] - maxval);
+        out_row[i] = exp_val;
+        thread_sum += exp_val;
+    }
+    shared[tid] = thread_sum;
+    __syncthreads();
+    
+    // Reduce sum in shared memory
+    for (int stride = block_size / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            shared[tid] += shared[tid + stride];
+        }
+        __syncthreads();
+    }
+    float sum = shared[0];
+    __syncthreads();
+    
+    // Step 3: Parallel normalization
+    float norm = 1.0f / sum;
+    for (int i = tid; i < T; i += block_size) {
+        out_row[i] *= norm;
+    }
+}
+
+// Helper functions for warp-level reductions (used by opt3 and opt4)
+__device__ float warpReduceMaxOpt(float val) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val = fmaxf(val, __shfl_down_sync(0xFFFFFFFF, val, offset));
+    }
+    return val;
+}
+
+__device__ float warpReduceSumOpt(float val) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+    }
+    return val;
+}
+
+// Optimization 3: Use warp-level primitives for efficient reductions
+// Fixes: No warp-level primitives - Uses __shfl_down_sync for faster reductions
+// This kernel shows how warp primitives operate at register level (faster than shared memory)
+__global__ void attention_softmax_opt3_warp(float* out, const float* inp, int N, int T) {
+    extern __shared__ float shared[];
+    
+    int row = blockIdx.x;
+    if (row >= N * T) return;
+    
+    int tid = threadIdx.x;
+    int warpId = tid / 32;
+    int laneId = tid % 32;
+    int block_size = blockDim.x;
+    int warpsPerBlock = block_size / 32;
+    
+    const float* inp_row = inp + row * T;
+    float* out_row = out + row * T;
+    
+    // Step 1: Find max with warp primitives (faster than shared memory!)
+    float thread_max = -INFINITY;
+    for (int i = tid; i < T; i += block_size) {
+        thread_max = fmaxf(thread_max, inp_row[i]);
+    }
+    
+    // Warp-level reduction (no shared memory within warp!)
+    float warp_max = warpReduceMaxOpt(thread_max);
+    
+    // First thread in each warp writes to shared memory
+    if (laneId == 0) {
+        shared[warpId] = warp_max;
+    }
+    __syncthreads();
+    
+    // First warp reduces across warps
+    if (tid < warpsPerBlock) {
+        warp_max = shared[tid];
+    } else {
+        warp_max = -INFINITY;
+    }
+    if (warpId == 0) {
+        warp_max = warpReduceMaxOpt(warp_max);
+    }
+    if (tid == 0) {
+        shared[0] = warp_max;
+    }
+    __syncthreads();
+    float maxval = shared[0];
+    
+    // Step 2: Compute exp and sum with warp primitives
+    float thread_sum = 0.0f;
+    for (int i = tid; i < T; i += block_size) {
+        float exp_val = expf(inp_row[i] - maxval);
+        out_row[i] = exp_val;
+        thread_sum += exp_val;
+    }
+    
+    // Warp-level reduction for sum
+    float warp_sum = warpReduceSumOpt(thread_sum);
+    
+    if (laneId == 0) {
+        shared[warpId] = warp_sum;
+    }
+    __syncthreads();
+    
+    // First warp reduces across warps
+    if (tid < warpsPerBlock) {
+        warp_sum = shared[tid];
+    } else {
+        warp_sum = 0.0f;
+    }
+    if (warpId == 0) {
+        warp_sum = warpReduceSumOpt(warp_sum);
+    }
+    if (tid == 0) {
+        shared[0] = warp_sum;
+    }
+    __syncthreads();
+    float sum = shared[0];
+    
+    // Step 3: Normalize
+    float norm = 1.0f / sum;
+    for (int i = tid; i < T; i += block_size) {
+        out_row[i] *= norm;
+    }
+}
+
+// Optimization 4: Improved memory coalescing with float4 loads
+// Fixes: Memory coalescing - Uses vectorized loads for better bandwidth
+// This kernel shows how reading 4 floats at once improves memory throughput
+__global__ void attention_softmax_opt4_vectorized(float* out, const float* inp, int N, int T) {
+    extern __shared__ float shared[];
+    
+    int row = blockIdx.x;
+    if (row >= N * T) return;
+    
+    int tid = threadIdx.x;
+    int warpId = tid / 32;
+    int laneId = tid % 32;
+    int block_size = blockDim.x;
+    int warpsPerBlock = block_size / 32;
+    
+    const float* inp_row = inp + row * T;
+    float* out_row = out + row * T;
+    
+    int T_vec = T / 4;  // Number of float4 elements
+    
+    // Step 1: Find max with vectorized loads (read 4 floats at once!)
+    float thread_max = -INFINITY;
+    for (int i = tid; i < T_vec; i += block_size) {
+        float4 vals = *reinterpret_cast<const float4*>(&inp_row[i * 4]);
+        thread_max = fmaxf(thread_max, fmaxf(fmaxf(vals.x, vals.y), fmaxf(vals.z, vals.w)));
+    }
+    // Handle remainder (if T not divisible by 4)
+    for (int i = T_vec * 4 + tid; i < T; i += block_size) {
+        thread_max = fmaxf(thread_max, inp_row[i]);
+    }
+    
+    // Warp reduction
+    float warp_max = warpReduceMaxOpt(thread_max);
+    if (laneId == 0) shared[warpId] = warp_max;
+    __syncthreads();
+    
+    if (tid < warpsPerBlock) warp_max = shared[tid];
+    else warp_max = -INFINITY;
+    if (warpId == 0) warp_max = warpReduceMaxOpt(warp_max);
+    if (tid == 0) shared[0] = warp_max;
+    __syncthreads();
+    float maxval = shared[0];
+    
+    // Step 2: Compute exp and sum with vectorized operations
+    float thread_sum = 0.0f;
+    for (int i = tid; i < T_vec; i += block_size) {
+        float4 vals = *reinterpret_cast<const float4*>(&inp_row[i * 4]);
+        float4 exp_vals;
+        exp_vals.x = expf(vals.x - maxval);
+        exp_vals.y = expf(vals.y - maxval);
+        exp_vals.z = expf(vals.z - maxval);
+        exp_vals.w = expf(vals.w - maxval);
+        *reinterpret_cast<float4*>(&out_row[i * 4]) = exp_vals;  // Write 4 at once!
+        thread_sum += exp_vals.x + exp_vals.y + exp_vals.z + exp_vals.w;
+    }
+    // Handle remainder
+    for (int i = T_vec * 4 + tid; i < T; i += block_size) {
+        float exp_val = expf(inp_row[i] - maxval);
+        out_row[i] = exp_val;
+        thread_sum += exp_val;
+    }
+    
+    // Warp reduction for sum
+    float warp_sum = warpReduceSumOpt(thread_sum);
+    if (laneId == 0) shared[warpId] = warp_sum;
+    __syncthreads();
+    
+    if (tid < warpsPerBlock) warp_sum = shared[tid];
+    else warp_sum = 0.0f;
+    if (warpId == 0) warp_sum = warpReduceSumOpt(warp_sum);
+    if (tid == 0) shared[0] = warp_sum;
+    __syncthreads();
+    float sum = shared[0];
+    
+    // Step 3: Normalize with vectorized stores
+    float norm = 1.0f / sum;
+    for (int i = tid; i < T_vec; i += block_size) {
+        float4 vals = *reinterpret_cast<const float4*>(&out_row[i * 4]);
+        vals.x *= norm;
+        vals.y *= norm;
+        vals.z *= norm;
+        vals.w *= norm;
+        *reinterpret_cast<float4*>(&out_row[i * 4]) = vals;
+    }
+    // Handle remainder
+    for (int i = T_vec * 4 + tid; i < T; i += block_size) {
+        out_row[i] *= norm;
+    }
+}
+
+// End of educational progressive optimizations
+// ----------------------------------------------------------------------------
 
 // warp-level reduction for finding the maximum value
 __device__ float warpReduceMax(float val) {
@@ -1225,6 +1548,193 @@ void attention_forward_cudnn(floatX* out,  // output: (B, T, NH, HS)
 
 #endif // ENABLE_CUDNN
 
+// ----------------------------------------------------------------------------
+// Educational optimization launchers - variants of attention_forward3 with different softmax kernels
+
+void attention_forward_opt1(float* out, float* vaccum, float* qkvr, float* preatt, float* att,
+                            const float* inp,
+                            int B, int T, int C, int NH,
+                            const int block_size) {
+    // Same as attention_forward3 but uses educational optimization 1 (shared memory)
+    int HS = C / NH;
+    
+    float *q, *k, *v;
+    q = qkvr + 0 * B * T * C;
+    k = qkvr + 1 * B * T * C;
+    v = qkvr + 2 * B * T * C;
+    int total_threads = B * NH * T * HS;
+    int num_blocks = ceil_div(total_threads, block_size);
+    permute_kernel<<<num_blocks, block_size>>>(q, k, v, inp, B, T, NH, HS);
+    
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasCheck(cublasSgemmStridedBatched(cublas_handle,
+                            CUBLAS_OP_T, CUBLAS_OP_N,
+                            T, T, HS, &alpha,
+                            k, HS, T * HS,
+                            q, HS, T * HS,
+                            &beta, preatt, T, T * T, B * NH));
+    
+    float scale = 1.0f / sqrtf(HS);
+    total_threads = B * NH * T * T;
+    num_blocks = ceil_div(total_threads, block_size);
+    scale_kernel<<<num_blocks, block_size>>>(preatt, scale, B, NH, T);
+    
+    // Educational optimization 1: shared memory softmax
+    int softmax_block_size = 256;
+    int grid_size = B * NH * T;
+    size_t shared_mem_size = T * sizeof(float);
+    attention_softmax_opt1_shared<<<grid_size, softmax_block_size, shared_mem_size>>>(att, preatt, B * NH, T);
+    
+    cublasCheck(cublasSgemmStridedBatched(cublas_handle,
+                            CUBLAS_OP_N, CUBLAS_OP_N,
+                            HS, T, T, &alpha,
+                            v, HS, T * HS,
+                            att, T, T * T,
+                            &beta, vaccum, HS, T * HS, B * NH));
+    
+    num_blocks = ceil_div(B * T * C, block_size);
+    unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
+}
+
+void attention_forward_opt2(float* out, float* vaccum, float* qkvr, float* preatt, float* att,
+                            const float* inp,
+                            int B, int T, int C, int NH,
+                            const int block_size) {
+    // Same as attention_forward3 but uses educational optimization 2 (parallel reduction)
+    int HS = C / NH;
+    
+    float *q, *k, *v;
+    q = qkvr + 0 * B * T * C;
+    k = qkvr + 1 * B * T * C;
+    v = qkvr + 2 * B * T * C;
+    int total_threads = B * NH * T * HS;
+    int num_blocks = ceil_div(total_threads, block_size);
+    permute_kernel<<<num_blocks, block_size>>>(q, k, v, inp, B, T, NH, HS);
+    
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasCheck(cublasSgemmStridedBatched(cublas_handle,
+                            CUBLAS_OP_T, CUBLAS_OP_N,
+                            T, T, HS, &alpha,
+                            k, HS, T * HS,
+                            q, HS, T * HS,
+                            &beta, preatt, T, T * T, B * NH));
+    
+    float scale = 1.0f / sqrtf(HS);
+    total_threads = B * NH * T * T;
+    num_blocks = ceil_div(total_threads, block_size);
+    scale_kernel<<<num_blocks, block_size>>>(preatt, scale, B, NH, T);
+    
+    // Educational optimization 2: parallel reduction softmax
+    int softmax_block_size = 256;
+    int grid_size = B * NH * T;
+    size_t shared_mem_size = softmax_block_size * sizeof(float);
+    attention_softmax_opt2_parallel<<<grid_size, softmax_block_size, shared_mem_size>>>(att, preatt, B * NH, T);
+    
+    cublasCheck(cublasSgemmStridedBatched(cublas_handle,
+                            CUBLAS_OP_N, CUBLAS_OP_N,
+                            HS, T, T, &alpha,
+                            v, HS, T * HS,
+                            att, T, T * T,
+                            &beta, vaccum, HS, T * HS, B * NH));
+    
+    num_blocks = ceil_div(B * T * C, block_size);
+    unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
+}
+
+void attention_forward_opt3(float* out, float* vaccum, float* qkvr, float* preatt, float* att,
+                            const float* inp,
+                            int B, int T, int C, int NH,
+                            const int block_size) {
+    // Same as attention_forward3 but uses educational optimization 3 (warp primitives)
+    int HS = C / NH;
+    
+    float *q, *k, *v;
+    q = qkvr + 0 * B * T * C;
+    k = qkvr + 1 * B * T * C;
+    v = qkvr + 2 * B * T * C;
+    int total_threads = B * NH * T * HS;
+    int num_blocks = ceil_div(total_threads, block_size);
+    permute_kernel<<<num_blocks, block_size>>>(q, k, v, inp, B, T, NH, HS);
+    
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasCheck(cublasSgemmStridedBatched(cublas_handle,
+                            CUBLAS_OP_T, CUBLAS_OP_N,
+                            T, T, HS, &alpha,
+                            k, HS, T * HS,
+                            q, HS, T * HS,
+                            &beta, preatt, T, T * T, B * NH));
+    
+    float scale = 1.0f / sqrtf(HS);
+    total_threads = B * NH * T * T;
+    num_blocks = ceil_div(total_threads, block_size);
+    scale_kernel<<<num_blocks, block_size>>>(preatt, scale, B, NH, T);
+    
+    // Educational optimization 3: warp primitives softmax
+    int softmax_block_size = 256;
+    int grid_size = B * NH * T;
+    size_t shared_mem_size = (softmax_block_size / 32) * sizeof(float);
+    attention_softmax_opt3_warp<<<grid_size, softmax_block_size, shared_mem_size>>>(att, preatt, B * NH, T);
+    
+    cublasCheck(cublasSgemmStridedBatched(cublas_handle,
+                            CUBLAS_OP_N, CUBLAS_OP_N,
+                            HS, T, T, &alpha,
+                            v, HS, T * HS,
+                            att, T, T * T,
+                            &beta, vaccum, HS, T * HS, B * NH));
+    
+    num_blocks = ceil_div(B * T * C, block_size);
+    unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
+}
+
+void attention_forward_opt4(float* out, float* vaccum, float* qkvr, float* preatt, float* att,
+                            const float* inp,
+                            int B, int T, int C, int NH,
+                            const int block_size) {
+    // Same as attention_forward3 but uses educational optimization 4 (vectorized memory)
+    int HS = C / NH;
+    
+    float *q, *k, *v;
+    q = qkvr + 0 * B * T * C;
+    k = qkvr + 1 * B * T * C;
+    v = qkvr + 2 * B * T * C;
+    int total_threads = B * NH * T * HS;
+    int num_blocks = ceil_div(total_threads, block_size);
+    permute_kernel<<<num_blocks, block_size>>>(q, k, v, inp, B, T, NH, HS);
+    
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasCheck(cublasSgemmStridedBatched(cublas_handle,
+                            CUBLAS_OP_T, CUBLAS_OP_N,
+                            T, T, HS, &alpha,
+                            k, HS, T * HS,
+                            q, HS, T * HS,
+                            &beta, preatt, T, T * T, B * NH));
+    
+    float scale = 1.0f / sqrtf(HS);
+    total_threads = B * NH * T * T;
+    num_blocks = ceil_div(total_threads, block_size);
+    scale_kernel<<<num_blocks, block_size>>>(preatt, scale, B, NH, T);
+    
+    // Educational optimization 4: vectorized memory softmax
+    int softmax_block_size = 256;
+    int grid_size = B * NH * T;
+    size_t shared_mem_size = (softmax_block_size / 32) * sizeof(float);
+    attention_softmax_opt4_vectorized<<<grid_size, softmax_block_size, shared_mem_size>>>(att, preatt, B * NH, T);
+    
+    cublasCheck(cublasSgemmStridedBatched(cublas_handle,
+                            CUBLAS_OP_N, CUBLAS_OP_N,
+                            HS, T, T, &alpha,
+                            v, HS, T * HS,
+                            att, T, T * T,
+                            &beta, vaccum, HS, T * HS, B * NH));
+    
+    num_blocks = ceil_div(B * T * C, block_size);
+    unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
+}
+
 // kernel version dispatch
 void attention_forward(int kernel_num,
                        float* out, float* stats, float* vaccum,
@@ -1255,8 +1765,20 @@ void attention_forward(int kernel_num,
                                (floatX*)preatt, (floatX*)att,
                                inp, B, T, C, NH, block_size, true);
             break;
+        case 7: // educational optimization 1: shared memory
+            attention_forward_opt1(out, vaccum, qkvr, preatt, att, inp, B, T, C, NH, block_size);
+            break;
+        case 8: // educational optimization 2: parallel reduction
+            attention_forward_opt2(out, vaccum, qkvr, preatt, att, inp, B, T, C, NH, block_size);
+            break;
+        case 9: // educational optimization 3: warp primitives
+            attention_forward_opt3(out, vaccum, qkvr, preatt, att, inp, B, T, C, NH, block_size);
+            break;
+        case 10: // educational optimization 4: vectorized memory
+            attention_forward_opt4(out, vaccum, qkvr, preatt, att, inp, B, T, C, NH, block_size);
+            break;
         #ifdef ENABLE_CUDNN
-        case 10:
+        case 11:
             // note: validation only cares about out, which is out_fp32 of the function
             // inp is hackily converted to FP16 into qkvr only on the first run
             // similarly, vaccum is converted to FP32 into out only on the first run
