@@ -729,14 +729,17 @@ __global__ void softmax_autoregressive_backward_kernel2(float* dpreatt, const fl
     int h = blockIdx.y;
     int b = blockIdx.z;
 
+    // Make sure thread is in bounds
     if (b < B && h < NH && t3 < T) {
         int hs = C / NH; // head size
         float scale = 1.0f / sqrtf(hs);
+        // Loop over t
         for (int t = t3; t < T; t++) {
             const float* att_bth = att + b*NH*T*T + h*T*T + t*T;
             const float* datt_bth = datt + b*NH*T*T + h*T*T + t*T;
             float* dpreatt_bth = dpreatt + b*NH*T*T + h*T*T + t*T;
             float accum = 0.0f;
+            // Compute the gradient for dpreatt_bth[t3]
             for (int t2 = 0; t2 <= t; t2++) {
                 float indicator = t2 == t3 ? 1.0f : 0.0f;
                 float local_derivative = att_bth[t2] * (indicator - att_bth[t3]);
@@ -756,11 +759,13 @@ __global__ void softmax_autoregressive_backward_kernel3(float* dpreatt, const fl
     int h = blockIdx.z % NH;
     int b = blockIdx.z / NH;
 
+    // Make sure thread is in bounds
     if (b < B && h < NH && t3 < T && t>=t3 && t < T) {
         const float* att_bth = att + b*NH*T*T + h*T*T + t*T;
         const float* datt_bth = datt + b*NH*T*T + h*T*T + t*T;
         float* dpreatt_bth = dpreatt + b*NH*T*T + h*T*T + t*T;
         float accum = 0.0f;
+        // Compute the gradient for dpreatt_bth[t3]
         for (int t2 = 0; t2 <= t; t2++) {
             float indicator = t2 == t3 ? 1.0f : 0.0f;
             float local_derivative = att_bth[t2] * (indicator - att_bth[t3]);
@@ -774,6 +779,7 @@ __global__ void softmax_autoregressive_backward_kernel3(float* dpreatt, const fl
 __global__ void softmax_autoregressive_backward_kernel4(float* dpreatt, const float* datt, const float* att,
                                                      int B, int T, int NH, int hs, float scale) {
 
+    // Allocate shared memory for att and datt
     extern __shared__ float shared_mem[];
     float* att_shared = shared_mem; // size T
     float* datt_shared = &shared_mem[T]; // size T
@@ -791,9 +797,11 @@ __global__ void softmax_autoregressive_backward_kernel4(float* dpreatt, const fl
     }
     __syncthreads();
 
+    // Make sure thread is in bounds
     if (b < B && h < NH && t3 < T && t>=t3 && t < T) {
         float* dpreatt_bth = dpreatt + b*NH*T*T + h*T*T + t*T;
         float accum = 0.0f;
+        // Compute the gradient for dpreatt_bth[t3]
         for (int t2 = 0; t2 <= t; t2++) {
             float indicator = t2 == t3 ? 1.0f : 0.0f;
             float local_derivative = att_shared[t2] * (indicator - att_shared[t3]);
@@ -807,6 +815,7 @@ __global__ void softmax_autoregressive_backward_kernel4(float* dpreatt, const fl
 __global__ void softmax_autoregressive_backward_kernel5(float* dpreatt, const float* datt, const float* att,
                                                      int B, int T, int NH, int hs, float scale) {
 
+    // Allocate shared memory for att, datt, and partial dot product
     extern __shared__ float shared_mem[];
     float* att_shared = shared_mem; // size T
     float* datt_shared = &shared_mem[T]; // size T
@@ -818,7 +827,7 @@ __global__ void softmax_autoregressive_backward_kernel5(float* dpreatt, const fl
     int h = blockIdx.z % NH;
     int b = blockIdx.z / NH;
 
-    // Fill shared memory
+    // Fill shared memory and compute partial dot product
     float thread_accum = 0.0f;
     for (int i = threadIdx.x; i <= t; i += blockDim.x) {
         att_shared[i] = att[b*NH*T*T + h*T*T + t*T + i];
@@ -839,7 +848,9 @@ __global__ void softmax_autoregressive_backward_kernel5(float* dpreatt, const fl
         num_active_threads = offset;
     }
 
+    // Make sure thread is in bounds
     if (b < B && h < NH && t3 < T && t>=t3 && t < T) {
+        // Compute the gradient for dpreatt_bth[t3] (using the precomputed dot product)
         dpreatt[b*NH*T*T + h*T*T + t*T + t3] = scale * att_shared[t3] * (datt_shared[t3] - partial_dot_product_shared[0]);
     }
 }
