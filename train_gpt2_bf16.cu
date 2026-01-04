@@ -1,14 +1,18 @@
 /*
-GPT-2 Transformer Neural Net trained in raw CUDA
-Non-trivial notes to be aware of:
+GPT-2 Transformer with BF16 Tensor Core Acceleration
 
-We are being clever in the backward pass to conserve memory.
-In particular, all parameters use a += in the backward pass, so we
-can later do gradient accumulation. But all activations have = instead of +=
-because these are faster (just read, no write). This is okay for all activations
-except for those in the residual stream, where the gradients have to add. We make
-sure that those parts work out ok and that we do a += as necessary. E.g.,
-the layernorms are connected to the residuals so we += in layernorm backward.
+BF16 (bfloat16) Mixed Precision Training:
+- Loads gpt2_124M_bf16.bin checkpoint (BF16 storage = 2x less memory)
+- Parameters stored in FP32 for precision
+- Uses CUBLAS_COMPUTE_32F_FAST_16BF for BF16 tensor cores
+- Activations/gradients in FP32 for numerical stability
+
+Why BF16 works (vs FP16):
+- BF16 has same exponent range as FP32 (8 bits)
+- No overflow/underflow issues with pre-trained models
+- FP16 has only 5-bit exponent → breaks easily
+
+Requires: Ampere+ GPU (compute 8.0+) for BF16 tensor cores
 */
 
 #include <stdio.h>
@@ -23,6 +27,7 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 // GPU / CUDA related
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 // our own utilities
@@ -68,6 +73,19 @@ static cublasComputeType_t cublas_compute_type;
 cublasHandle_t cublas_handle;
 
 namespace cg = cooperative_groups;
+
+// ----------------------------------------------------------------------------
+// BF16 conversion helpers
+
+// Convert BF16 to FP32 on CPU
+void bf16_to_fp32_cpu(float* fp32_data, const unsigned short* bf16_data, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        // BF16 is just the upper 16 bits of FP32
+        // To convert: shift BF16 left by 16 bits to get FP32
+        unsigned int fp32_bits = ((unsigned int)bf16_data[i]) << 16;
+        fp32_data[i] = *((float*)&fp32_bits);
+    }
+}
 
 // ----------------------------------------------------------------------------
 // all the kernels
@@ -1732,12 +1750,24 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     // create memory for model parameters on the device
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_sizes, 1);
 
-    // read in all the parameters from file and copy them to device
-    float* params_memory_cpu = (float*)mallocCheck(num_parameters * sizeof(float));
-    freadCheck(params_memory_cpu, sizeof(float), num_parameters, model_file);
-    cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, num_parameters * sizeof(float), cudaMemcpyHostToDevice));
-    free(params_memory_cpu);
+    // BF16 checkpoint: read as BF16, convert to FP32
+    printf("Loading BF16 checkpoint and converting to FP32...\n");
+    unsigned short* params_bf16_cpu = (unsigned short*)mallocCheck(num_parameters * sizeof(unsigned short));
+    float* params_fp32_cpu = (float*)mallocCheck(num_parameters * sizeof(float));
+    
+    // Read BF16 data from file (2 bytes per parameter)
+    freadCheck(params_bf16_cpu, sizeof(unsigned short), num_parameters, model_file);
+    
+    // Convert BF16 → FP32 on CPU
+    bf16_to_fp32_cpu(params_fp32_cpu, params_bf16_cpu, num_parameters);
+    
+    // Copy FP32 parameters to GPU
+    cudaCheck(cudaMemcpy(model->params_memory, params_fp32_cpu, num_parameters * sizeof(float), cudaMemcpyHostToDevice));
+    
+    free(params_bf16_cpu);
+    free(params_fp32_cpu);
     fcloseCheck(model_file);
+    printf("BF16 checkpoint loaded successfully (saved 50%% memory on disk)\n");
 
     // other inits
     model->acts_memory = NULL;
@@ -2193,20 +2223,28 @@ int main(int argc, char *argv[]) {
     cudaCheck(cudaSetDevice(deviceIdx));
     cudaDeviceProp deviceProp;
     cudaGetDeviceProperties(&deviceProp, deviceIdx);
-    // setup cuBLAS and cuBLASLt
+    // setup cuBLAS with BF16 tensor core support
     cublasCheck(cublasCreate(&cublas_handle));
-    // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
-    int enable_tf32 = deviceProp.major >= 8 ? 1 : 0;
-    cublas_compute_type = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
-    cublasMath_t cublas_math_mode = enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
-    cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
-    printf("| device                | %-50s |\n", deviceProp.name);
-    printf("| TF32                  | %-50s |\n", enable_tf32 ? "enabled" : "disabled");
+    // BF16 tensor cores require Ampere+ (compute 8.0+)
+    int enable_bf16_tc = deviceProp.major >= 8 ? 1 : 0;
+    if (enable_bf16_tc) {
+        cublas_compute_type = CUBLAS_COMPUTE_32F_FAST_16BF;  // FP32 I/O, BF16 tensor core compute
+        cublasCheck(cublasSetMathMode(cublas_handle, CUBLAS_TF32_TENSOR_OP_MATH));
+        printf("| device                | %-50s |\n", deviceProp.name);
+        printf("| tensor cores          | %-50s |\n", "enabled (BF16)");
+        printf("| compute capability    | %d.%-44d |\n", deviceProp.major, deviceProp.minor);
+    } else {
+        cublas_compute_type = CUBLAS_COMPUTE_32F;
+        cublasCheck(cublasSetMathMode(cublas_handle, CUBLAS_DEFAULT_MATH));
+        printf("| device                | %-50s |\n", deviceProp.name);
+        printf("| tensor cores          | %-50s |\n", "not available (need Ampere+ compute 8.0+)");
+        printf("WARNING: BF16 tensor cores not available! This will be slow.\n");
+    }
     printf("+-----------------------+----------------------------------------------------+\n");
 
-    // build the GPT-2 model from a checkpoint
+    // build the GPT-2 model from BF16 checkpoint
     GPT2 model;
-    gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
+    gpt2_build_from_checkpoint(&model, "gpt2_124M_bf16.bin");
     printf("| max_sequence_length T | %-50d |\n", model.config.max_seq_len);
     printf("| vocab_size V          | %-50d |\n", model.config.vocab_size);
     printf("| padded_vocab_size Vp  | %-50d |\n", model.config.padded_vocab_size);
