@@ -1161,16 +1161,18 @@ __global__ void matmul_forward_kernel4(float* __restrict__ out, //output matrix 
 }
 
 // kernel to add bias after cuBLAS matmul
-__global__ void add_bias_kernel(float* out,
-                                const float* bias,
-                                int BT,
-                                int OC) {
+__global__ void add_bias_kernel(
+    float* out,
+    const float* bias,
+    int BT,
+    int OC) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < BT * OC) {
-        int oc = idx % OC;
-        out[idx] += bias[oc];
+        int o = idx % OC;     // output channel
+        out[idx] += bias[o];
     }
 }
+
 // kernel 5: use cuBLASGemmEx for matmul + custom kernel for bias addition
 void matmul_forward5(float* out,
                      const float* inp,
@@ -1184,34 +1186,32 @@ void matmul_forward5(float* out,
     const float beta  = 0.0f;
 
     cublasCheck(
-        cublasGemmEx(
-            cublas_handle,
-            CUBLAS_OP_N,        // weight: (OC x C)
-            CUBLAS_OP_T,        // inp:    (BT x C) -> (C x BT)
-            OC,                 // m
-            BT,                 // n
-            C,                  // k
-            &alpha,
-            weight,
-            CUDA_R_32F,
-            OC,                 // lda
-            inp,
-            CUDA_R_32F,
-            BT,                 // ldb
-            &beta,
-            out,
-            CUDA_R_32F,
-            OC,                 // ldc
-            cublas_compute_type,
-            CUBLAS_GEMM_DEFAULT_TENSOR_OP
-        )
+      cublasGemmEx(
+        cublas_handle,
+        CUBLAS_OP_T,      // A = weight^T : C x OC
+        CUBLAS_OP_N,      // B = inp      : C x BT
+        OC,               // m  (rows of A^T)
+        BT,               // n  (cols of B)
+        C,                // k
+        &alpha,
+        weight,
+        CUDA_R_32F,
+        C,                // lda = rows of weight^T
+        inp,
+        CUDA_R_32F,
+        C,                // ldb = rows of inp
+        &beta,
+        out,
+        CUDA_R_32F,
+        OC,               // ldc
+        cublas_compute_type,
+        CUBLAS_GEMM_DEFAULT
+     )
     );
 
-    // Add bias: out[bt, oc] += bias[oc]
     if (bias != NULL) {
         int threads = 256;
         int blocks  = (BT * OC + threads - 1) / threads;
-
         add_bias_kernel<<<blocks, threads>>>(out, bias, BT, OC);
         cudaCheck(cudaGetLastError());
     }
