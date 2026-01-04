@@ -1451,8 +1451,8 @@ void attention_backward(__half* dinp, __half* dqkvr, __half* dpreatt, __half* da
                         int B, int T, int C, int NH) {
     const int block_size = 256;
     int HS = C / NH; // head size
-    const __half one = __float2half(1.0f);
-    const __half zero = __float2half(0.0f); // note beta = 1.0f so that we accumulate gradients (+=)
+    float one = 1.0f;
+    float zero = 0.0f;
     // unpack convenience pointers into q, k, v
     const __half *q, *k, *v;
     q = qkvr + 0 * B * T * C;
@@ -1467,8 +1467,6 @@ void attention_backward(__half* dinp, __half* dqkvr, __half* dpreatt, __half* da
     unpermute_kernel_backward<<<num_blocks, block_size>>>(scratch, dout, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
     // backward into datt
-    float one = 1.0f;
-    float zero = 0.0f;
     cublasCheck(cublasGemmStridedBatchedEx(cublas_handle, 
         CUBLAS_OP_T, CUBLAS_OP_N, 
         T, T, HS, 
