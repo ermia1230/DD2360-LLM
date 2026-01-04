@@ -8,11 +8,17 @@ nvcc -O3 --use_fast_math -Xcompiler -fopenmp matmul_forward.cu -o matmul_forward
 version 1 is naive port from CPU code to kernel: parallelizes over B,T, loops over C
 OMP_NUM_THREADS=32 ./matmul_forward 1
 
-version 2 calls cuBLAS, very fast
+version 2 is an optimized tiled kernel (shared-memory tiling, coalesced loads, register tiling)
 OMP_NUM_THREADS=32 ./matmul_forward 2
 
-version 3 calls cuBLASLt, should be even faster
+version 3 is the tiled kernel that loads tiles into shared memory to improve locality
 OMP_NUM_THREADS=32 ./matmul_forward 3
+
+version 4 is the tiled + unrolled kernel (shared memory + loop unrolling for ILP)
+OMP_NUM_THREADS=32 ./matmul_forward 4
+
+version 5 uses cuBLASGemmEx for matmul + custom kernel for bias addition
+OMP_NUM_THREADS=32 ./matmul_forward 5
 */
 
 #include <stdio.h>
@@ -72,10 +78,10 @@ __global__ void matmul_forward_kernel1(float* out,
     }
 }
 
-// kernel 5: naive kernel with tilling and GEMM structure
 #define TILE_M 16
 #define TILE_N 16
-__global__ void matmul_forward_kernel5(float* out, //output matrix [BT, OC]
+// kernel 2: naive kernel with tiling and GEMM structure
+__global__ void matmul_forward_kernel2(float* out, //output matrix [BT, OC]
                                        const float* inp, // input matrix [BT, C]
                                        const float* weight, // weight matrix [OC, C]
                                        const float* bias, // bias vector [OC]
@@ -103,18 +109,18 @@ __global__ void matmul_forward_kernel5(float* out, //output matrix [BT, OC]
     }
 }
 
-// kernel 6: kernel 5 with shared memory and memory coalescing
+// kernel 3: kernel 2 with shared memory and memory coalescing
 #define TILE_K 32
 
-__global__ void matmul_forward_kernel6(float* out, //output matrix [BT, OC]
+__global__ void matmul_forward_kernel3(float* out, //output matrix [BT, OC]
                                        const float* inp, // input matrix [BT, C]
                                        const float* weight, // weight matrix [OC, C]
                                        const float* bias, // bias vector [OC]
                                        int BT, int C, int OC) {
      
     // Shared memory
-    __shared__ float inp_s[TILE_M][TILE_K]; // input tile
-    __shared__ float weight_s[TILE_N][TILE_K]; // weight tile
+    __shared__ float inp_s[TILE_M][TILE_K + 1]; // input tile
+    __shared__ float weight_s[TILE_N][TILE_K + 1]; // weight tile
     
     // Thread coordinates in block
     int ty = threadIdx.y; // row within the block
@@ -181,16 +187,16 @@ __global__ void matmul_forward_kernel6(float* out, //output matrix [BT, OC]
     }
 }
 
-// kernel 7: kernel 6 with loop unrolling
-__global__ void matmul_forward_kernel7(float* out, //output matrix [BT, OC]
-                                       const float* inp, // input matrix [BT, C]
-                                       const float* weight, // weight matrix [OC, C]
-                                       const float* bias, // bias vector [OC]
+// kernel 4: kernel 3 with loop unrolling
+__global__ void matmul_forward_kernel4(float* __restrict__ out, //output matrix [BT, OC]
+                                       const float* __restrict__ inp, // input matrix [BT, C]
+                                       const float* __restrict__ weight, // weight matrix [OC, C]
+                                       const float* __restrict__ bias, // bias vector [OC]
                                        int BT, int C, int OC) {
      
     // Shared memory
-    __shared__ float inp_s[TILE_M][TILE_K]; // input tile
-    __shared__ float weight_s[TILE_N][TILE_K]; // weight tile
+    __shared__ float inp_s[TILE_M][TILE_K + 1]; // input tile
+    __shared__ float weight_s[TILE_N][TILE_K + 1]; // weight tile
     
     // Thread coordinates in block
     int ty = threadIdx.y; // row within the block
@@ -258,99 +264,64 @@ __global__ void matmul_forward_kernel7(float* out, //output matrix [BT, OC]
     }
 }
 
-// is there no better way other than just adding bias with a whole separate kernel?
-// this is a highly memory-bound operation, should be fused into the matmul kernel
-// but i can't seem to find a cuBLAS function that does this
-__global__ void add_bias(float* out, const float* bias, int B, int T, int OC) {
+// kernel to add bias after cuBLAS matmul
+__global__ void add_bias_kernel(
+    float* out,
+    const float* bias,
+    int BT,
+    int OC) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int stride = blockDim.x * gridDim.x;
-    for (int i = idx; i < B * T * OC; i += stride) {
-        int col = i % OC;
-        out[i] += bias[col];
+    if (idx < BT * OC) {
+        int o = idx % OC;     // output channel
+        out[idx] += bias[o];
     }
 }
 
-// kernel 4: semi-efficient handwritten kernel
-// see trimat_forward.cu for some intermediate development steps
-__device__ float4 ld_vec(const float* address) {
-    return *reinterpret_cast<const float4*>(address);
-}
+// kernel 5: use cuBLASGemmEx for matmul + custom kernel for bias addition
+void matmul_forward5(float* out,
+                     const float* inp,
+                     const float* weight,
+                     const float* bias,
+                     int B, int T, int C, int OC) {
 
-__device__ void st_vec(float* address, float4 val) {
-    *reinterpret_cast<float4*>(address) = val;
-}
+    int BT = B * T;
 
-__global__ void __launch_bounds__(16*16) matmul_forward_kernel4(float* out,
-                                       const float* inp, const float* weight, const float* bias,
-                                       int C, int OC) {
-    // out is (B,T,OC). OC is short for "output channels", e.g. OC = 4 * C
-    // inp is (B,T,C), weight is (OC, C), bias is (OC)
-    // each thread handles 8x8 elements; each block 128 by 128 elements.
-    int oc = 8*(blockIdx.y * blockDim.y + threadIdx.y);
+    const float alpha = 1.0f;
+    const float beta  = 0.0f;
 
-    // buffers to cache chunks of the input matrices
-    __shared__ float lhs_s[128][32];
-    __shared__ float rhs_s[128][32];
+    cublasCheck(
+      cublasGemmEx(
+        cublas_handle,
+        CUBLAS_OP_T,      // A = weight^T : C x OC
+        CUBLAS_OP_N,      // B = inp      : C x BT
+        OC,               // m  (rows of A^T)
+        BT,               // n  (cols of B)
+        C,                // k
+        &alpha,
+        weight,
+        CUDA_R_32F,
+        C,                // lda = rows of weight^T
+        inp,
+        CUDA_R_32F,
+        C,                // ldb = rows of inp
+        &beta,
+        out,
+        CUDA_R_32F,
+        OC,               // ldc
+        cublas_compute_type,
+        CUBLAS_GEMM_DEFAULT
+     )
+    );
 
-    // adjust our pointers for the current block
-    inp += 128 * blockIdx.x * C;
-    weight += 128 * blockIdx.y * C;
-    out += 128 * blockIdx.x * OC + 128 * blockIdx.y;
-
-    float vals[8][8] = {};
-    if(bias != NULL) {
-        for (int i = 0; i < 8; i++) {
-            for (int j = 0; j < 8; j += 4) {
-                float4 b = ld_vec(bias + oc + j);
-                vals[i][j+0] = b.x;
-                vals[i][j+1] = b.y;
-                vals[i][j+2] = b.z;
-                vals[i][j+3] = b.w;
-            }
-        }
-    }
-
-    int si_start = 4*(16 * threadIdx.y + threadIdx.x);
-    for (int so = 0; so < C; so += 32) {
-        __syncthreads();
-        int xmod8 = threadIdx.x % 8;
-        int xby8 = threadIdx.x / 8;
-        int xo = 4 * xmod8;
-        for(int y = 2 * threadIdx.y + xby8; y < 128; y += 32) {
-            st_vec(&lhs_s[y][xo], ld_vec(inp + y * C + so + xo));
-            st_vec(&rhs_s[y][xo], ld_vec(weight + y * C + so + xo));
-        }
-        __syncthreads();
-
-        for (int si = si_start; si < si_start + 32; si += 4) {
-            float4 rhs[8];
-            for (int u = 0; u < 8; ++u) {
-                rhs[u] = ld_vec(&rhs_s[u + 8 * threadIdx.y][si % 32]);
-            }
-
-            for (int ii = 0; ii < 8; ++ii) {
-                float4 lhs = ld_vec(&lhs_s[ii + 8 * threadIdx.x][si % 32]);
-                for (int ji = 0; ji < 8; ++ji) {
-                    vals[ii][ji] += lhs.x * rhs[ji].x;
-                    vals[ii][ji] += lhs.y * rhs[ji].y;
-                    vals[ii][ji] += lhs.z * rhs[ji].z;
-                    vals[ii][ji] += lhs.w * rhs[ji].w;
-                }
-            }
-        }
-    }
-
-    for (int i = 0; i < 8; ++i) {
-        for (int j = 0; j < 8; j += 4) {
-            float4 result;
-            result.x = vals[i][j + 0];
-            result.y = vals[i][j + 1];
-            result.z = vals[i][j + 2];
-            result.w = vals[i][j + 3];
-            st_vec(out + (8*threadIdx.x+i) * OC + 8*threadIdx.y + j, result);
-        }
+    if (bias != NULL) {
+        int threads = 256;
+        int blocks  = (BT * OC + threads - 1) / threads;
+        add_bias_kernel<<<blocks, threads>>>(out, bias, BT, OC);
+        cudaCheck(cudaGetLastError());
     }
 }
+
+
 
 // ----------------------------------------------------------------------------
 // kernel launcher
@@ -368,195 +339,63 @@ void matmul_forward1(float* out,
     cudaCheck(cudaGetLastError());
 }
 
-// kernel 5 is a naive kernel with tiling
-void matmul_forward5(float* out,
-                     const float* inp, const float* weight, const float* bias,
-                     int B, int T, int C, int OC) {
-
-    int BT = B * T;
-
-    dim3 blockDim(TILE_N, TILE_M);
-    dim3 gridDim(
-        ceil_div(BT, TILE_M),
-        ceil_div(OC, TILE_N)
-    );
-
-    matmul_forward_kernel5<<<gridDim, blockDim>>>(
-        out, inp, weight, bias, BT, C, OC
-    );
-    cudaCheck(cudaGetLastError());
-}
-
-// kernel 6 is a naive kernel with tiling, shared memory and memory coalescing 
-void matmul_forward6(float* out,
-                     const float* inp, const float* weight, const float* bias,
-                     int B, int T, int C, int OC) {
-
-    int BT = B * T;
-
-    dim3 blockDim(TILE_N, TILE_M);
-    dim3 gridDim(
-        ceil_div(BT, TILE_M),
-        ceil_div(OC, TILE_N)
-    );
-
-    matmul_forward_kernel7<<<gridDim, blockDim>>>(
-        out, inp, weight, bias, BT, C, OC
-    );
-    cudaCheck(cudaGetLastError());
-}
-
-// kernel 7 is kernel 6 with loop unrolling (identical launcher to 7)
-void matmul_forward7(float* out,
-                     const float* inp, const float* weight, const float* bias,
-                     int B, int T, int C, int OC) {
-
-    int BT = B * T;
-
-    dim3 blockDim(TILE_N, TILE_M);
-    dim3 gridDim(
-        ceil_div(BT, TILE_M),
-        ceil_div(OC, TILE_N)
-    );
-
-    matmul_forward_kernel7<<<gridDim, blockDim>>>(
-        out, inp, weight, bias, BT, C, OC
-    );
-    cudaCheck(cudaGetLastError());
-}
-
-// kernel 2 calls cuBLAS, which should be very efficient
+// kernel 2 is a naive kernel with tiling
 void matmul_forward2(float* out,
                      const float* inp, const float* weight, const float* bias,
-                     int B, int T, int C, int OC,
-                     const int sqrt_block_size) {
-    // for reference API is:
-    // cublasStatus_t cublasSgemm(cublasHandle_t handle,
-    //                        cublasOperation_t transa, cublasOperation_t transb,
-    //                        int m, int n, int k,
-    //                        const float           *alpha,
-    //                        const float           *A, int lda,
-    //                        const float           *B, int ldb,
-    //                        const float           *beta,
-    //                        float           *C, int ldc)
-    // for us, inp is (B*T, C), weight is (OC, C), out is (B*T, OC)
-    // cuBLAS does C = alpha * A * B + beta * C
-    // where A is mxk, B is kxn, C is mxn
-    // now, because we use row-major storage, cuBLAS (which is column-major) sees our matrices transposed.
-    // algorithmically / in e.g. PyTorch we want to do: out = inp @ weight.T
-    // but because cuBLAS is column-major, we actually want to get it to calculate out.T . Mathematically, this is:
-    // out.T = weight @ inp.T
-    // but again, our variables look transposed, so using the actual weight/inp we have here in this function, this becomes
-    // out.T = weight.T @ inp
-    // so we need to get cuBLAS to calculate weight.T @ inp (the variables here are the actual ones in this function)
-    // => need to call cuBLAS with A = weight, B = inp
-    // => need to call cuBLAS with transa = CUBLAS_OP_T, transb = CUBLAS_OP_N
+                     int B, int T, int C, int OC) {
 
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
-    cublasCheck(cublasSgemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, OC, B*T, C, &alpha, weight, C, inp, C, &beta, out, OC));
-    // and now we still have to add the bias... (ew)
-    if (bias != NULL) {
-        int block_size = sqrt_block_size * sqrt_block_size;
-        int grid_size = ceil_div(OC * B * T, block_size);
-        add_bias<<<grid_size, block_size>>>(out, bias, B, T, OC);
-        cudaCheck(cudaGetLastError());
-    }
+    int BT = B * T;
+
+    dim3 blockDim(TILE_N, TILE_M);
+    dim3 gridDim(
+        ceil_div(BT, TILE_M),
+        ceil_div(OC, TILE_N)
+    );
+
+    matmul_forward_kernel2<<<gridDim, blockDim>>>(
+        out, inp, weight, bias, BT, C, OC
+    );
+    cudaCheck(cudaGetLastError());
 }
 
-// uses cublasLt to fuse the bias and gelu
-// https://docs.nvidia.com/cuda/cublas/#cublasltmatmul
-// https://github.com/NVIDIA/CUDALibrarySamples/blob/master/cuBLASLt/LtSgemm/sample_cublasLt_LtSgemm.cu
+// kernel 3 is a kernel with tiling, shared memory and memory coalescing 
 void matmul_forward3(float* out,
                      const float* inp, const float* weight, const float* bias,
                      int B, int T, int C, int OC) {
-    int has_bias = (bias != NULL);
-    int has_gelu = 0;
 
-    // check bias alignment
-    if(((uintptr_t)bias % 16) != 0) {
-        printf("Bias pointer is not aligned (cuBLASLt requirement)!\n");
-        exit(EXIT_FAILURE);
-    }
+    int BT = B * T;
 
-    int returnedResults = 0;
-    cublasLtMatmulDesc_t operationDesc;
-    cublasLtMatmulPreference_t preference;
-    cublasLtMatrixLayout_t weightLayout;
-    cublasLtMatrixLayout_t inputLayout;
-    cublasLtMatrixLayout_t outputLayout;
-    cublasLtMatrixLayout_t biasLayout;
-    cublasLtMatmulHeuristicResult_t heuristic;
+    dim3 blockDim(TILE_N, TILE_M);
+    dim3 gridDim(
+        ceil_div(BT, TILE_M),
+        ceil_div(OC, TILE_N)
+    );
 
-    // create the operation descriptor
-    cublasOperation_t opNoTranspose = CUBLAS_OP_N;
-    cublasOperation_t opTranspose = CUBLAS_OP_T;
-    cublasLtEpilogue_t epilogueBias = CUBLASLT_EPILOGUE_DEFAULT;
-    if (has_bias && has_gelu) {
-        epilogueBias = CUBLASLT_EPILOGUE_GELU_BIAS;
-    } else if (has_bias) {
-        epilogueBias = CUBLASLT_EPILOGUE_BIAS;
-    } else if (has_gelu) {
-        epilogueBias = CUBLASLT_EPILOGUE_GELU;
-    }
-    cublasCheck(cublasLtMatmulDescCreate(&operationDesc, cublas_compute_type, CUDA_R_32F));
-    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &opTranspose, sizeof(opTranspose)));
-    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &opNoTranspose, sizeof(opNoTranspose)));
-    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogueBias, sizeof(epilogueBias)));
-    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
-
-    // define matrix layouts
-    cublasCheck(cublasLtMatrixLayoutCreate(&weightLayout, CUDA_R_32F, C, OC, C));
-    cublasCheck(cublasLtMatrixLayoutCreate(&inputLayout, CUDA_R_32F, C, B*T, C));
-    cublasCheck(cublasLtMatrixLayoutCreate(&outputLayout, CUDA_R_32F, OC, B*T, OC));
-    cublasCheck(cublasLtMatrixLayoutCreate(&biasLayout, CUDA_R_32F, OC, 1, OC));
-
-    // create a preference handle with specified max workspace
-    cublasCheck(cublasLtMatmulPreferenceCreate(&preference));
-    cublasCheck(cublasLtMatmulPreferenceSetAttribute(preference,
-        CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-        &cublaslt_workspace_size, sizeof(cublaslt_workspace_size)));
-
-    // find a suitable algorithm
-    cublasCheck(cublasLtMatmulAlgoGetHeuristic(cublaslt_handle, operationDesc,
-        weightLayout, inputLayout, outputLayout, outputLayout,
-        preference, 1, &heuristic, &returnedResults));
-    if (returnedResults == 0) {
-        printf("No cuBLASLt algorithm: B: %d, T: %d, C: %d, OC: %d, bias: %d, gelu: %d\n",
-            B, T, C, OC, has_bias, has_gelu);
-        exit(EXIT_FAILURE);
-    }
-
-    // call the matmul
-    const float alpha = 1.0f, beta = 0.0f;
-    cublasCheck(cublasLtMatmul(cublaslt_handle, operationDesc,
-        &alpha, weight, weightLayout, inp, inputLayout, &beta,
-        out, outputLayout, out, outputLayout, &heuristic.algo,
-        cublaslt_workspace, cublaslt_workspace_size, 0));
-
-    // cleanups
-    cublasCheck(cublasLtMatmulPreferenceDestroy(preference));
-    cublasCheck(cublasLtMatmulDescDestroy(operationDesc));
-    cublasCheck(cublasLtMatrixLayoutDestroy(weightLayout));
-    cublasCheck(cublasLtMatrixLayoutDestroy(inputLayout));
-    cublasCheck(cublasLtMatrixLayoutDestroy(outputLayout));
-    cublasCheck(cublasLtMatrixLayoutDestroy(biasLayout));
-}
-
-// handwritten, relatively efficient non-tensorcore matmul kernel
-void matmul_forward4(float* out,
-                     const float* inp, const float* weight, const float* bias,
-                     int B, int T, int C, int OC,
-                     int sqrt_block_size) {
-    // out is (B,T,OC). OC is short for "output channels", e.g. OC = 4 * C
-    // inp is (B,T,C), weight is (OC, C), bias is (OC)
-    sqrt_block_size = 16;
-
-    dim3 gridDim(ceil_div(B * T, 8*sqrt_block_size), ceil_div(OC, 8*sqrt_block_size));
-    dim3 blockDim(sqrt_block_size, sqrt_block_size);
-    matmul_forward_kernel4<<<gridDim, blockDim>>>(out, inp, weight, bias, C, OC);
+    matmul_forward_kernel3<<<gridDim, blockDim>>>(
+        out, inp, weight, bias, BT, C, OC
+    );
     cudaCheck(cudaGetLastError());
 }
+
+// kernel 4 is kernel 3 with loop unrolling 
+void matmul_forward4(float* out,
+                     const float* inp, const float* weight, const float* bias,
+                     int B, int T, int C, int OC) {
+
+    int BT = B * T;
+
+    dim3 blockDim(TILE_N, TILE_M);
+    dim3 gridDim(
+        ceil_div(BT, TILE_M),
+        ceil_div(OC, TILE_N)
+    );
+
+    matmul_forward_kernel4<<<gridDim, blockDim>>>(
+        out, inp, weight, bias, BT, C, OC
+    );
+    cudaCheck(cudaGetLastError());
+}
+
 
 // kernel version dispatch
 void matmul_forward(int kernel_num,
@@ -569,22 +408,16 @@ void matmul_forward(int kernel_num,
             matmul_forward1(out, inp, weight, bias, B, T, C, OC, sqrt_block_size);
             break;
         case 2:
-            matmul_forward2(out, inp, weight, bias, B, T, C, OC, sqrt_block_size);
+            matmul_forward2(out, inp, weight, bias, B, T, C, OC);
             break;
         case 3:
             matmul_forward3(out, inp, weight, bias, B, T, C, OC);
             break;
         case 4:
-            matmul_forward4(out, inp, weight, bias, B, T, C, OC, sqrt_block_size);
+            matmul_forward4(out, inp, weight, bias, B, T, C, OC);
             break;
         case 5:
             matmul_forward5(out, inp, weight, bias, B, T, C, OC);
-            break;
-        case 6:
-            matmul_forward6(out, inp, weight, bias, B, T, C, OC);
-            break;
-        case 7:
-            matmul_forward7(out, inp, weight, bias, B, T, C, OC);
             break;
         default:
             printf("Invalid kernel number\n");
@@ -665,7 +498,7 @@ int main(int argc, char **argv) {
     for (int j = 0; j < sizeof(sqrt_block_sizes) / sizeof(int); j++) {
         int sqrt_block_size = sqrt_block_sizes[j];
 
-        int repeat_times = 100;
+        int repeat_times = 1000;
         float elapsed_time = benchmark_kernel(repeat_times, matmul_forward,
                                               kernel_num, d_out, d_inp, d_weight, d_bias,
                                               B, T, C, OC, sqrt_block_size);

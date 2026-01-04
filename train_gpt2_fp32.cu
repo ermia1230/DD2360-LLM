@@ -36,6 +36,7 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 // Define kernels to use
 #define SOFTMAX_FORWARD_KERNEL 5  // 1=baseline, 2=o1(warp), 3=o2(online), 4=o3(vectorized), 5=o4(combined)
 #define SOFTMAX_BACKWARD_KERNEL 5
+#define MATMUL_FORWARD_KERNEL 4
 
 
 // ----------------------------------------------------------------------------
@@ -953,6 +954,7 @@ __device__ void st_vec(float* address, float4 val) {
     *reinterpret_cast<float4*>(address) = val;
 }
 
+// kernel 1: naive kernel, every thread handles one output element, direct global memory access
 __global__ void matmul_forward_kernel1(float* out,
                                        const float* inp, const float* weight, const float* bias,
                                        int BT, int C, int OC) {
@@ -963,19 +965,19 @@ __global__ void matmul_forward_kernel1(float* out,
     int oc = blockIdx.y * blockDim.y + threadIdx.y;
     if (bt < BT && oc < OC) {
         float val = (bias != NULL) ? bias[oc] : 0.0f;
-        const float* wrow = weight + oc*C;
-        const float* inp_bt = inp + bt*C;
+        const float* wrow = weight + oc * C;
+        const float* inp_bt = inp + bt * C;
         for (int i = 0; i < C; i++) {
             val += inp_bt[i] * wrow[i];
         }
-        out[bt * OC + oc] = val;
+        out[bt * OC + oc] = val; 
     }
 }
 
-// kernel 5: naive kernel with tilling and GEMM structure
 #define TILE_M 16
 #define TILE_N 16
-__global__ void matmul_forward_kernel5(float* out, //output matrix [BT, OC]
+// kernel 2: naive kernel with tiling and GEMM structure
+__global__ void matmul_forward_kernel2(float* out, //output matrix [BT, OC]
                                        const float* inp, // input matrix [BT, C]
                                        const float* weight, // weight matrix [OC, C]
                                        const float* bias, // bias vector [OC]
@@ -1003,18 +1005,18 @@ __global__ void matmul_forward_kernel5(float* out, //output matrix [BT, OC]
     }
 }
 
-// kernel 6: kernel 5 with shared memory and memory coalescing
+// kernel 3: kernel 2 with shared memory and memory coalescing
 #define TILE_K 32
 
-__global__ void matmul_forward_kernel6(float* out, //output matrix [BT, OC]
+__global__ void matmul_forward_kernel3(float* out, //output matrix [BT, OC]
                                        const float* inp, // input matrix [BT, C]
                                        const float* weight, // weight matrix [OC, C]
                                        const float* bias, // bias vector [OC]
                                        int BT, int C, int OC) {
      
     // Shared memory
-    __shared__ float inp_s[TILE_M][TILE_K]; // input tile
-    __shared__ float weight_s[TILE_N][TILE_K]; // weight tile
+    __shared__ float inp_s[TILE_M][TILE_K + 1]; // input tile
+    __shared__ float weight_s[TILE_N][TILE_K + 1]; // weight tile
     
     // Thread coordinates in block
     int ty = threadIdx.y; // row within the block
@@ -1081,16 +1083,16 @@ __global__ void matmul_forward_kernel6(float* out, //output matrix [BT, OC]
     }
 }
 
-// kernel 7: kernel 6 with loop unrolling
-__global__ void matmul_forward_kernel7(float* out, //output matrix [BT, OC]
-                                       const float* inp, // input matrix [BT, C]
-                                       const float* weight, // weight matrix [OC, C]
-                                       const float* bias, // bias vector [OC]
+// kernel 4: kernel 3 with loop unrolling
+__global__ void matmul_forward_kernel4(float* __restrict__ out, //output matrix [BT, OC]
+                                       const float* __restrict__ inp, // input matrix [BT, C]
+                                       const float* __restrict__ weight, // weight matrix [OC, C]
+                                       const float* __restrict__ bias, // bias vector [OC]
                                        int BT, int C, int OC) {
      
     // Shared memory
-    __shared__ float inp_s[TILE_M][TILE_K]; // input tile
-    __shared__ float weight_s[TILE_N][TILE_K]; // weight tile
+    __shared__ float inp_s[TILE_M][TILE_K + 1]; // input tile
+    __shared__ float weight_s[TILE_N][TILE_K + 1]; // weight tile
     
     // Thread coordinates in block
     int ty = threadIdx.y; // row within the block
@@ -1158,6 +1160,63 @@ __global__ void matmul_forward_kernel7(float* out, //output matrix [BT, OC]
     }
 }
 
+// kernel to add bias after cuBLAS matmul
+__global__ void add_bias_kernel(float* out,
+                                const float* bias,
+                                int BT,
+                                int OC) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < BT * OC) {
+        int oc = idx % OC;
+        out[idx] += bias[oc];
+    }
+}
+// kernel 5: use cuBLASGemmEx for matmul + custom kernel for bias addition
+void matmul_forward5(float* out,
+                     const float* inp,
+                     const float* weight,
+                     const float* bias,
+                     int B, int T, int C, int OC) {
+
+    int BT = B * T;
+
+    const float alpha = 1.0f;
+    const float beta  = 0.0f;
+
+    cublasCheck(
+        cublasGemmEx(
+            cublas_handle,
+            CUBLAS_OP_N,        // weight: (OC x C)
+            CUBLAS_OP_T,        // inp:    (BT x C) -> (C x BT)
+            OC,                 // m
+            BT,                 // n
+            C,                  // k
+            &alpha,
+            weight,
+            CUDA_R_32F,
+            OC,                 // lda
+            inp,
+            CUDA_R_32F,
+            BT,                 // ldb
+            &beta,
+            out,
+            CUDA_R_32F,
+            OC,                 // ldc
+            cublas_compute_type,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP
+        )
+    );
+
+    // Add bias: out[bt, oc] += bias[oc]
+    if (bias != NULL) {
+        int threads = 256;
+        int blocks  = (BT * OC + threads - 1) / threads;
+
+        add_bias_kernel<<<blocks, threads>>>(out, bias, BT, OC);
+        cudaCheck(cudaGetLastError());
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launchers
 
@@ -1193,19 +1252,19 @@ void layernorm_forward(float* out, float* mean, float* rstd,
 
 // kernel 1 is the most naive matmul kernel
 void matmul_forward1(float* out,
-                    const float* inp, const float* weight, const float* bias,
-                    int B, int T, int C, int OC) {
+                     const float* inp, const float* weight, const float* bias,
+                     int B, int T, int C, int OC,
+                     const int sqrt_block_size) {
     // out is (B,T,OC). OC is short for "output channels", e.g. OC = 4 * C
     // inp is (B,T,C), weight is (OC, C), bias is (OC)
-    const int BT = B * T;
-    dim3 gridDim(CEIL_DIV(BT, 16), CEIL_DIV(OC, 16));
-    dim3 blockDim(16, 16);
-    matmul_forward_kernel1<<<gridDim, blockDim>>>(out, inp, weight, bias, BT, C, OC);
+    dim3 gridDim(ceil_div(B * T, sqrt_block_size), ceil_div(OC, sqrt_block_size));
+    dim3 blockDim(sqrt_block_size, sqrt_block_size);
+    matmul_forward_kernel1<<<gridDim, blockDim>>>(out, inp, weight, bias, B*T, C, OC);
     cudaCheck(cudaGetLastError());
 }
 
-// kernel 5 is a naive kernel with tiling
-void matmul_forward5(float* out,
+// kernel 2 is a naive kernel with tiling
+void matmul_forward2(float* out,
                      const float* inp, const float* weight, const float* bias,
                      int B, int T, int C, int OC) {
 
@@ -1213,18 +1272,18 @@ void matmul_forward5(float* out,
 
     dim3 blockDim(TILE_N, TILE_M);
     dim3 gridDim(
-        CEIL_DIV(BT, TILE_M),
-        CEIL_DIV(OC, TILE_N)
+        ceil_div(BT, TILE_M),
+        ceil_div(OC, TILE_N)
     );
 
-    matmul_forward_kernel5<<<gridDim, blockDim>>>(
+    matmul_forward_kernel2<<<gridDim, blockDim>>>(
         out, inp, weight, bias, BT, C, OC
     );
     cudaCheck(cudaGetLastError());
 }
 
-// kernel 6 is a naive kernel with tiling, shared memory and memory coalescing 
-void matmul_forward6(float* out,
+// kernel 3 is a kernel with tiling, shared memory and memory coalescing 
+void matmul_forward3(float* out,
                      const float* inp, const float* weight, const float* bias,
                      int B, int T, int C, int OC) {
 
@@ -1232,18 +1291,18 @@ void matmul_forward6(float* out,
 
     dim3 blockDim(TILE_N, TILE_M);
     dim3 gridDim(
-        CEIL_DIV(BT, TILE_M),
-        CEIL_DIV(OC, TILE_N)
+        ceil_div(BT, TILE_M),
+        ceil_div(OC, TILE_N)
     );
 
-    matmul_forward_kernel7<<<gridDim, blockDim>>>(
+    matmul_forward_kernel3<<<gridDim, blockDim>>>(
         out, inp, weight, bias, BT, C, OC
     );
     cudaCheck(cudaGetLastError());
 }
 
-// kernel 7 is kernel 6 with loop unrolling (identical launcher to 7)
-void matmul_forward7(float* out,
+// kernel 4 is kernel 3 with loop unrolling 
+void matmul_forward4(float* out,
                      const float* inp, const float* weight, const float* bias,
                      int B, int T, int C, int OC) {
 
@@ -1251,14 +1310,38 @@ void matmul_forward7(float* out,
 
     dim3 blockDim(TILE_N, TILE_M);
     dim3 gridDim(
-        CEIL_DIV(BT, TILE_M),
-        CEIL_DIV(OC, TILE_N)
+        ceil_div(BT, TILE_M),
+        ceil_div(OC, TILE_N)
     );
 
-    matmul_forward_kernel7<<<gridDim, blockDim>>>(
+    matmul_forward_kernel4<<<gridDim, blockDim>>>(
         out, inp, weight, bias, BT, C, OC
     );
     cudaCheck(cudaGetLastError());
+}
+
+// dispatcher: call the selected matmul forward kernel using if/else-if
+void matmul_forward(int kernel_num,
+                    float* out,
+                    const float* inp, const float* weight, const float* bias,
+                    int B, int T, int C, int OC) {
+    // default block size to use if kernel 1 is selected (sqrt x sqrt threads)
+    const int default_sqrt_block = 8;
+    if (kernel_num == 1) {
+        matmul_forward1(out, inp, weight, bias, B, T, C, OC, default_sqrt_block);
+    } else if (kernel_num == 2) {
+        matmul_forward2(out, inp, weight, bias, B, T, C, OC);
+    } else if (kernel_num == 3) {
+        matmul_forward3(out, inp, weight, bias, B, T, C, OC);
+    } else if (kernel_num == 4) {
+        matmul_forward4(out, inp, weight, bias, B, T, C, OC);
+    } else if (kernel_num == 5) {
+        matmul_forward5(out, inp, weight, bias, B, T, C, OC);
+    } else {
+        // invalid kernel number: report and abort
+        printf("Invalid matmul kernel (%d)\n", kernel_num);
+        exit(1);
+    }
 }
 
 void attention_forward(float* out, float* qkvr, float* att,
@@ -1867,20 +1950,20 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
 
         // now do the forward pass
         layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
-        matmul_forward7(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
+        matmul_forward(MATMUL_FORWARD_KERNEL, scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
         attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH);
-        matmul_forward7(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
+        matmul_forward(MATMUL_FORWARD_KERNEL, l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
         residual_forward(l_residual2, residual, l_attproj, B*T*C);
         layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
-        matmul_forward7(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
+        matmul_forward(MATMUL_FORWARD_KERNEL, l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
         gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
-        matmul_forward7(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
+        matmul_forward(MATMUL_FORWARD_KERNEL, l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);       
         residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
     }
 
     residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
-    matmul_forward7(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp);
+    matmul_forward(MATMUL_FORWARD_KERNEL, acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp);
 
     // also forward the cross-entropy loss function if we have the targets
     if (targets != NULL) {
