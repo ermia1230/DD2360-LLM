@@ -995,16 +995,18 @@ __global__ void matmul_forward_kernel2(float* out, //output matrix [BT, OC]
     int bt = blockIdx.x * TILE_M + ty; // row index in output
     int oc = blockIdx.y * TILE_N + tx; // column index in output
     
+    // check boundarie conditions
     if (bt < BT && oc < OC) {
-        float val = (bias != NULL) ? bias[oc]: 0.0f;
+        float val = (bias != NULL) ? bias[oc]: 0.0f; // add bias if provided
 
         const float* wrow = weight + oc * C; // point to the start of the weight row
         const float* inp_bt = inp + bt * C; // point to the start of the input row
 
+        // compute the dot product
         for (int i = 0; i < C; i++){
             val += inp_bt[i] * wrow[i];
         }
-
+        // write back the result
         out[bt * OC + oc] = val;
     }
 }
@@ -1083,9 +1085,10 @@ __global__ void matmul_forward_kernel3(float* out, //output matrix [BT, OC]
 
     }
 
+    // boundary check before writing back
     if (bt < BT && oc < OC) {
-        val += (bias != NULL) ? bias[oc]: 0.0f;
-        out[bt * OC + oc] = val;
+        val += (bias != NULL) ? bias[oc]: 0.0f; // add bias if provided
+        out[bt * OC + oc] = val; // write back the result
     }
 }
 
@@ -1161,9 +1164,10 @@ __global__ void matmul_forward_kernel4(float* __restrict__ out, //output matrix 
 
     }
 
+    // boundary check before writing back
     if (bt < BT && oc < OC) {
-        val += (bias != NULL) ? bias[oc]: 0.0f;
-        out[bt * OC + oc] = val;
+        val += (bias != NULL) ? bias[oc]: 0.0f; // add bias if provided
+        out[bt * OC + oc] = val; // write back the result
     }
 }
 
