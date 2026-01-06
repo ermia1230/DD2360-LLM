@@ -5,19 +5,35 @@ It's advised to use OpenMP here because the CPU implementation is fairly slow ot
 Compile example:
 nvcc -O3 --use_fast_math -Xcompiler -fopenmp matmul_forward.cu -o matmul_forward -lcublas -lcublasLt
 
-version 1 is naive port from CPU code to kernel: parallelizes over B,T, loops over C
+version 1 — naive per-element kernel:
+    - Each CUDA thread computes one output element out[bt, oc].
+    - Good for functional correctness and parameter sweeps (sqrt_block_size controls blockDim.x/y).
+Run with:
 OMP_NUM_THREADS=32 ./matmul_forward 1
 
-version 2 is an optimized tiled kernel (shared-memory tiling, coalesced loads, register tiling)
+version 2 — tiled GEMM-style kernel:
+    - Thread-blocks cover tiles of size TILE_M x TILE_N.
+    - Each thread computes one tile element; loop over K is not tiled with shared memory.
+Run with:
 OMP_NUM_THREADS=32 ./matmul_forward 2
 
-version 3 is the tiled kernel that loads tiles into shared memory to improve locality
+version 3 — tiled + shared-memory:
+    - Loads input (BT x C) and weight tiles into shared memory (TILE_K) for reuse.
+    - Coalesced loads into shared memory and per-block reductions for dot-products.
+Run with:   
 OMP_NUM_THREADS=32 ./matmul_forward 3
 
-version 4 is the tiled + unrolled kernel (shared memory + loop unrolling for ILP)
+version 4 — tiled + shared-memory + loop unrolling + restricted pointers:
+    - Same as version 3 but with #pragma unroll on the inner k-loop and restricted pointers.
+Run with:
 OMP_NUM_THREADS=32 ./matmul_forward 4
 
-version 5 uses cuBLASGemmEx for matmul + custom kernel for bias addition
+version 5 — cuBLAS-based GEMM:
+    - Uses cublasGemmEx to compute out[BT x OC] = inp[BT x C] * weight^T[C x OC].
+    - We call cuBLAS with transA = CUBLAS_OP_T and transB = CUBLAS_OP_N so the output memory layout matches row-major [BT x OC].
+    - After GEMM a small kernel adds bias if provided (out[bt,oc] += bias[oc]).
+    - Uses CUBLAS_GEMM_DEFAULT for broad GPU compatibility (e.g., T4).
+Run with:
 OMP_NUM_THREADS=32 ./matmul_forward 5
 */
 
@@ -109,9 +125,9 @@ __global__ void matmul_forward_kernel2(float* out, //output matrix [BT, OC]
     }
 }
 
-// kernel 3: kernel 2 with shared memory and memory coalescing
-#define TILE_K 32
 
+#define TILE_K 32
+// kernel 3: kernel 2 with shared memory and memory coalescing
 __global__ void matmul_forward_kernel3(float* out, //output matrix [BT, OC]
                                        const float* inp, // input matrix [BT, C]
                                        const float* weight, // weight matrix [OC, C]
@@ -187,7 +203,7 @@ __global__ void matmul_forward_kernel3(float* out, //output matrix [BT, OC]
     }
 }
 
-// kernel 4: kernel 3 with loop unrolling
+// kernel 4: kernel 3 with loop unrolling and restrict qualifiers
 __global__ void matmul_forward_kernel4(float* __restrict__ out, //output matrix [BT, OC]
                                        const float* __restrict__ inp, // input matrix [BT, C]
                                        const float* __restrict__ weight, // weight matrix [OC, C]
@@ -264,7 +280,7 @@ __global__ void matmul_forward_kernel4(float* __restrict__ out, //output matrix 
     }
 }
 
-// kernel to add bias after cuBLAS matmul
+// helper kernel to add bias after cuBLAS matmul
 __global__ void add_bias_kernel(
     float* out,
     const float* bias,
@@ -277,7 +293,7 @@ __global__ void add_bias_kernel(
     }
 }
 
-// kernel 5: use cuBLASGemmEx for matmul + custom kernel for bias addition
+// kernel 5: use cuBLASGemmEx for matmul + helper kernel for bias addition
 void matmul_forward5(float* out,
                      const float* inp,
                      const float* weight,
@@ -339,7 +355,7 @@ void matmul_forward1(float* out,
     cudaCheck(cudaGetLastError());
 }
 
-// kernel 2 is a naive kernel with tiling
+// kernel 2 is a naive kernel in GEMM structure with tiling
 void matmul_forward2(float* out,
                      const float* inp, const float* weight, const float* bias,
                      int B, int T, int C, int OC) {
@@ -358,7 +374,7 @@ void matmul_forward2(float* out,
     cudaCheck(cudaGetLastError());
 }
 
-// kernel 3 is a kernel with tiling, shared memory and memory coalescing 
+// kernel 3 is kernel 2 with shared memory and memory coalescing
 void matmul_forward3(float* out,
                      const float* inp, const float* weight, const float* bias,
                      int B, int T, int C, int OC) {
@@ -377,7 +393,7 @@ void matmul_forward3(float* out,
     cudaCheck(cudaGetLastError());
 }
 
-// kernel 4 is kernel 3 with loop unrolling 
+// kernel 4 is kernel 3 with loop unrolling and restrict qualifiers 
 void matmul_forward4(float* out,
                      const float* inp, const float* weight, const float* bias,
                      int B, int T, int C, int OC) {

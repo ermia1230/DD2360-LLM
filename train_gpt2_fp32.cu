@@ -36,7 +36,7 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 // Define kernels to use
 #define SOFTMAX_FORWARD_KERNEL 5  // 1=baseline, 2=o1(warp), 3=o2(online), 4=o3(vectorized), 5=o4(combined)
 #define SOFTMAX_BACKWARD_KERNEL 5
-#define MATMUL_FORWARD_KERNEL 5
+#define MATMUL_FORWARD_KERNEL 5 // 1=naive, 2=tiling, 3=shared mem, 4=loop unrolling, 5=cuBLAS
 
 
 // ----------------------------------------------------------------------------
@@ -954,7 +954,9 @@ __device__ void st_vec(float* address, float4 val) {
     *reinterpret_cast<float4*>(address) = val;
 }
 
-// kernel 1: naive kernel, every thread handles one output element, direct global memory access
+// kernel 1: naive per-element kernel:
+//    - Each CUDA thread computes one output element out[bt, oc].
+//    - Good for functional correctness and parameter sweeps (sqrt_block_size controls blockDim.x/y).
 __global__ void matmul_forward_kernel1(float* out,
                                        const float* inp, const float* weight, const float* bias,
                                        int BT, int C, int OC) {
@@ -976,7 +978,9 @@ __global__ void matmul_forward_kernel1(float* out,
 
 #define TILE_M 16
 #define TILE_N 16
-// kernel 2: naive kernel with tiling and GEMM structure
+// kernel 2: tiled GEMM-style kernel:
+//    - Thread-blocks cover tiles of size TILE_M x TILE_N.
+//    - Each thread computes one tile element; loop over K is not tiled with shared memory.
 __global__ void matmul_forward_kernel2(float* out, //output matrix [BT, OC]
                                        const float* inp, // input matrix [BT, C]
                                        const float* weight, // weight matrix [OC, C]
@@ -1005,9 +1009,11 @@ __global__ void matmul_forward_kernel2(float* out, //output matrix [BT, OC]
     }
 }
 
-// kernel 3: kernel 2 with shared memory and memory coalescing
-#define TILE_K 32
 
+#define TILE_K 32
+// kernel 3: tiled + shared-memory:
+//    - Loads input (BT x C) and weight tiles into shared memory (TILE_K) for reuse.
+//    - Coalesced loads into shared memory and per-block reductions for dot-products.
 __global__ void matmul_forward_kernel3(float* out, //output matrix [BT, OC]
                                        const float* inp, // input matrix [BT, C]
                                        const float* weight, // weight matrix [OC, C]
@@ -1083,7 +1089,8 @@ __global__ void matmul_forward_kernel3(float* out, //output matrix [BT, OC]
     }
 }
 
-// kernel 4: kernel 3 with loop unrolling
+// kernel 4: tiled + shared-memory + loop unrolling + restricted pointers:
+//    - Same as version 3 but with #pragma unroll on the inner k-loop and restricted pointers.
 __global__ void matmul_forward_kernel4(float* __restrict__ out, //output matrix [BT, OC]
                                        const float* __restrict__ inp, // input matrix [BT, C]
                                        const float* __restrict__ weight, // weight matrix [OC, C]
@@ -1160,7 +1167,7 @@ __global__ void matmul_forward_kernel4(float* __restrict__ out, //output matrix 
     }
 }
 
-// kernel to add bias after cuBLAS matmul
+// helper kernel to add bias after cuBLAS matmul
 __global__ void add_bias_kernel(
     float* out,
     const float* bias,
@@ -1173,7 +1180,11 @@ __global__ void add_bias_kernel(
     }
 }
 
-// kernel 5: use cuBLASGemmEx for matmul + custom kernel for bias addition
+// kernel 5: — cuBLAS-based GEMM:
+//    - Uses cublasGemmEx to compute out[BT x OC] = inp[BT x C] * weight^T[C x OC].
+//    - We call cuBLAS with transA = CUBLAS_OP_T and transB = CUBLAS_OP_N so the output memory layout matches row-major [BT x OC].
+//    - After GEMM a small kernel adds bias if provided (out[bt,oc] += bias[oc]).
+//    - Uses CUBLAS_GEMM_DEFAULT for broad GPU compatibility (e.g., T4).
 void matmul_forward5(float* out,
                      const float* inp,
                      const float* weight,
@@ -1301,7 +1312,7 @@ void matmul_forward3(float* out,
     cudaCheck(cudaGetLastError());
 }
 
-// kernel 4 is kernel 3 with loop unrolling 
+// kernel 4 is kernel 3 with loop unrolling and restrict qualifiers
 void matmul_forward4(float* out,
                      const float* inp, const float* weight, const float* bias,
                      int B, int T, int C, int OC) {
