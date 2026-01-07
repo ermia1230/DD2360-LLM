@@ -47,6 +47,17 @@ to
 if (0)
 ```
 
+## Profiling
+To know how much time each kernel takes in each version we used:
+```bash
+nvprof ./train_gpt2fp32cu
+```
+
+To profile the kernels we used:
+```bash
+ncu -o profile_report ./train_gpt2fp32cu  
+```
+
 # Checking the outputs
 To check the outputs one can use the appropriate files in the dev/cuda/ folder.
 
@@ -61,6 +72,8 @@ Run it with:
 OMP_NUM_THREADS=32 ./attention_backward 1
 ```
 
+Profiling was done in train_gpt2fp32cu.
+
 Note: One can test kernels o1(2), o2(3) o3(4) and o4(5) by changing the command line argument to 11, 12, 13 and 14, respectively.
 
 ## Test matmul_forward_kernel
@@ -72,6 +85,11 @@ cd dev/cuda && nvcc -O3 --use_fast_math -Xcompiler -fopenmp -arch=sm_75 matmul_f
 Run it with:
 ```bash
 OMP_NUM_THREADS=32 ./matmul_forward 1
+```
+
+Profile with:
+```bash
+ncu --set basic --launch-skip 1 --launch-count 1 ./matmul_forward 1
 ```
 
 Note: One can test kernels 2, 3, 4, 5 by changing the command line argument to 2, 3, 4, 5, respectively.
