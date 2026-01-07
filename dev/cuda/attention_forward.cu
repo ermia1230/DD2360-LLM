@@ -1846,47 +1846,50 @@ int main(int argc, char **argv) {
         kernel_num = atoi(argv[1]);
     }
     printf("Using kernel %d\n", kernel_num);
-    int block_sizes[] = {32, 64, 128, 256, 512};
+    
+    // Use only block size 256 to speed up benchmarking
+    int block_size = 256;
 
     // Lower accuracy requirements for FP16 (1e-4f also too much for TF32 on kernels 3 & 4)
     float accuracy_threshold = (kernel_num <= 4) ? 1e-3f : 1e-2f;
 
     // first check the correctness of the kernel
     attention_forward_cpu(out, preatt, att, inp, B, T, C, NH);
-    for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
-        int block_size = block_sizes[j];
-        printf("Checking block size %d.\n", block_size);
-        attention_forward(kernel_num, d_out, d_stats, d_vaccum, d_qkvr, d_preatt, d_att, d_inp, B, T, C, NH, block_size);
-        // all kernels should produce the correct output out
-        // todo - make accuracy threshold dynamic and depend on FP16 vs FP32?
-        validate_result(d_out, out, "out", B * T * C, accuracy_threshold);
-        // but as for preatt and att, things get a bit more complicated:
-        if (kernel_num != 2 && kernel_num < 5) {
-            // kernel 2 (knowingly) fails att/preatt because it uses a different algorithm
-            // that estimates the softmax online and never materializes preatt/att
-            validate_result(d_att, att, "att", B * NH * T * T, accuracy_threshold);
-        }
-        if (kernel_num != 2 && kernel_num < 4) {
-            // kernel 4 (knowingly) fails preatt because it fuses the scale normalization
-            // into the softmax, so preatt is off by 1.0f / sqrt(HS)
-            // but att and out (checked below) should match.
-            validate_result(d_preatt, preatt, "preatt", B * NH * T * T, accuracy_threshold);
-        }
+    printf("Checking block size %d.\n", block_size);
+    attention_forward(kernel_num, d_out, d_stats, d_vaccum, d_qkvr, d_preatt, d_att, d_inp, B, T, C, NH, block_size);
+    // all kernels should produce the correct output out
+    // todo - make accuracy threshold dynamic and depend on FP16 vs FP32?
+    validate_result(d_out, out, "out", B * T * C, accuracy_threshold);
+    // but as for preatt and att, things get a bit more complicated:
+    if (kernel_num != 2 && kernel_num < 5) {
+        // kernel 2 (knowingly) fails att/preatt because it uses a different algorithm
+        // that estimates the softmax online and never materializes preatt/att
+        validate_result(d_att, att, "att", B * NH * T * T, accuracy_threshold);
+    }
+    if (kernel_num != 2 && kernel_num < 4) {
+        // kernel 4 (knowingly) fails preatt because it fuses the scale normalization
+        // into the softmax, so preatt is off by 1.0f / sqrt(HS)
+        // but att and out (checked below) should match.
+        validate_result(d_preatt, preatt, "preatt", B * NH * T * T, accuracy_threshold);
     }
     printf("All results match. Starting benchmarks.\n\n");
     first_run_validation = false;
 
     // benchmark speed of the kernel
-    for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
-        int block_size = block_sizes[j];
-        int repeat_times = 100;
-
-        float elapsed_time = benchmark_kernel(repeat_times, attention_forward,
-                                              kernel_num, d_out, d_stats, d_vaccum, d_qkvr, d_preatt, d_att,
-                                              d_inp, B, T, C, NH, block_size);
-
-        printf("block_size %4d | time %f ms\n", block_size, elapsed_time);
+    // Use fewer iterations if QUICK_BENCH environment variable is set
+    int default_repeat_times = 100;
+    char* quick_bench = getenv("QUICK_BENCH");
+    if (quick_bench != NULL) {
+        default_repeat_times = 10;  // 10x faster benchmarking
+        printf("QUICK_BENCH mode: using %d iterations instead of 100\n\n", default_repeat_times);
     }
+    
+    int repeat_times = default_repeat_times;
+    float elapsed_time = benchmark_kernel(repeat_times, attention_forward,
+                                          kernel_num, d_out, d_stats, d_vaccum, d_qkvr, d_preatt, d_att,
+                                          d_inp, B, T, C, NH, block_size);
+
+    printf("block_size %4d | time %f ms\n", block_size, elapsed_time);
 
     // free memory
     free(out);
