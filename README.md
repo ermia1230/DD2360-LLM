@@ -58,7 +58,7 @@ cd dev/cuda && nvcc -O3 --use_fast_math -Xcompiler -fopenmp -arch=sm_75 attentio
 
 Run it with:
 ```bash
-cd dev/cuda && OMP_NUM_THREADS=32 ./attention_backward 1
+OMP_NUM_THREADS=32 ./attention_backward 1
 ```
 
 Note: One can test kernels o1(2), o2(3) o3(4) and o4(5) by changing the command line argument to 11, 12, 13 and 14, respectively.
@@ -71,7 +71,7 @@ cd dev/cuda && nvcc -O3 --use_fast_math -Xcompiler -fopenmp -arch=sm_75 matmul_f
 
 Run it with:
 ```bash
-cd dev/cuda && OMP_NUM_THREADS=32 ./matmul_forward 1
+OMP_NUM_THREADS=32 ./matmul_forward 1
 ```
 
 Note: One can test kernels 2, 3, 4, 5 by changing the command line argument to 2, 3, 4, 5, respectively.
