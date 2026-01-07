@@ -96,3 +96,26 @@ Note: One can test kernels 2, 3, 4, 5 by changing the command line argument to 2
 
 
 ## Test softmax_forward_kernel
+Run the benchmark script:
+```bash
+cd dev/cuda && bash benchmark_attention_softmax.sh
+```
+
+This will compile and benchmark all softmax kernel optimizations (K1-baseline, K7-shared memory, K8-parallel reduction, K9-warp primitives, K10-vectorized) with automatic validation, execution time measurement, TFLOPS calculation, and NCU profiling for compute/memory throughput.
+
+Results are saved to:
+- `benchmark_results/attention_softmax_results.txt`
+- `benchmark_results/attention_softmax_results.csv`
+
+Note: K1 (naive baseline) is very slow (~2+ seconds). To skip it, edit the script and change `KERNELS=(1 7 8 9 10)` to `KERNELS=(7 8 9 10)`.
+
+Individual kernel testing:
+```bash
+cd dev/cuda && nvcc -O3 --use_fast_math -lcublas -lcublasLt -arch=sm_75 attention_forward.cu -o attention_forward
+./attention_forward 7  # Test K7 (shared memory)
+```
+
+Profile with:
+```bash
+ncu --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed ./attention_forward 7
+```
