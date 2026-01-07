@@ -19,6 +19,9 @@ After that and after compiling the code, one can start the GPT2 training by runn
 ./train_gpt2fp32cu
 ```
 
+## Run experiments
+To run the code with different kernels one must change the variables SOFTMAX_FORWARD_KERNEL, SOFTMAX_BACKWARD_KERNEL and MATMUL_FORWARD_KERNEL to the desired kernels. The default is our best version (all set to 5).
+
 Note: To run the code exactly how we did it in the experiments one must change (in lines 2332 and 2333):
 ```cpp
 int train_num_batches = train_loader.num_tokens / (B*T); // let's do 1 epoch by default for now

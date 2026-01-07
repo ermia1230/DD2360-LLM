@@ -35,7 +35,7 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 
 // Define kernels to use
 #define SOFTMAX_FORWARD_KERNEL 5  // 1=baseline, 2=o1(warp), 3=o2(online), 4=o3(vectorized), 5=o4(combined)
-#define SOFTMAX_BACKWARD_KERNEL 5
+#define SOFTMAX_BACKWARD_KERNEL 5 // 1=baseline, 2=parallel batches and heads, 3=parallel sequences, 4=shared mem, 5=optimized algorithm
 #define MATMUL_FORWARD_KERNEL 5 // 1=naive, 2=tiling, 3=shared mem, 4=loop unrolling, 5=cuBLAS
 
 
