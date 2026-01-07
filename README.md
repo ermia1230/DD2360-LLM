@@ -53,12 +53,12 @@ To check the outputs one can use the appropriate files in the dev/cuda/ folder.
 ## Test softmax_autoregressive_backward_kernel
 Compile attention_backward.cu using:
 ```bash
-nvcc -O3 --use_fast_math -Xcompiler -fopenmp -arch=sm_75 attention_backward.cu -o attention_backward -lcublas -lcublasLt
+cd dev/cuda && nvcc -O3 --use_fast_math -Xcompiler -fopenmp -arch=sm_75 attention_backward.cu -o attention_backward -lcublas -lcublasLt
 ```
 
 Run it with:
 ```bash
-OMP_NUM_THREADS=32 ./attention_backward 1
+cd dev/cuda && OMP_NUM_THREADS=32 ./attention_backward 1
 ```
 
 Note: One can test kernels o1(2), o2(3) o3(4) and o4(5) by changing the command line argument to 11, 12, 13 and 14, respectively.
