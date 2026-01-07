@@ -51,7 +51,7 @@ echo "--------------------|----------------------|-----------------|------------
 
 BASELINE_TIME=""
 
-# Enable quick benchmarking mode (10 iterations instead of 100)
+# Enable quick benchmarking mode (1 iterations instead of 100)
 export QUICK_BENCH=1
 
 for i in "${!KERNELS[@]}"; do

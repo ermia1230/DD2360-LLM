@@ -1880,7 +1880,7 @@ int main(int argc, char **argv) {
     int default_repeat_times = 100;
     char* quick_bench = getenv("QUICK_BENCH");
     if (quick_bench != NULL) {
-        default_repeat_times = 10;  // 10x faster benchmarking
+        default_repeat_times = 1;  // 100x faster benchmarking
         printf("QUICK_BENCH mode: using %d iterations instead of 100\n\n", default_repeat_times);
     }
     
